@@ -1,0 +1,4 @@
+# Paquete de contenido base del juego.
+# Cada carpeta dentro de content/ es un paquete; un mod es simplemente otra carpeta.
+name = "Base"
+description = "Bloques del juego base"

@@ -1,0 +1,24 @@
+[package]
+name = "voxel-client"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "voxel"
+path = "src/main.rs"
+
+[dependencies]
+voxel-common.workspace = true
+voxel-server.workspace = true
+wgpu = "26"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+glam.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+quinn.workspace = true

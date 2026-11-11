@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/common", "crates/server", "crates/client"]
+default-members = ["crates/client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+voxel-common = { path = "crates/common" }
+voxel-server = { path = "crates/server" }
+glam = "0.30"
+rayon = "1"
+rustc-hash = "2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive", "rc"] }
+postcard = { version = "1", features = ["use-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "signal"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+bytes = "1"
+toml = "0.8"
+
+# Debug usable: nuestro código con optimización ligera, dependencias a tope.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
