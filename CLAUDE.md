@@ -288,6 +288,11 @@ Opciones de desarrollo (variables de entorno):
 | `VOXEL_SCREENSHOT=ruta.ppm` | Guarda un frame al terminar de cargar y sale |
 | `RUST_LOG=voxel=debug` | Vuelca fps y contadores por consola |
 
+Registro de carga del cliente: `world loaded in …` sale una sola vez, al terminar la carga
+inicial. Después solo avisa (`nearby terrain was incomplete for …`, nivel warn) si la capa
+de chunks de la cámara, dentro del radio de voxeles, estuvo más de 0,25 s sin estar lista
+para dibujarse; es la señal de que el servidor o el mallado no dan abasto.
+
 Para verificar un cambio visual: capturar con `VOXEL_SCREENSHOT` + `VOXEL_CAMERA`,
 convertir el PPM a PNG y mirarlo. Ajustes de aspecto (`BEVEL_RADIUS`, `AO_MIN`, color del
 cielo) al principio de `crates/client/src/render/mod.rs`; colores de bloques en

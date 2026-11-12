@@ -171,6 +171,30 @@ impl World {
         self.mesh_in_flight == 0 && self.lod_in_flight == 0 && self.mesh_queue.is_empty()
     }
 
+    /// Cuántos chunks de la capa horizontal de la cámara, dentro de `radius` chunks, aún
+    /// no están listos para dibujarse (sin recibir, o recibidos y sin mallar).
+    ///
+    /// Es la medida de "se ve un hueco cerca": esa capa siempre le toca al cliente, así
+    /// que si falta algo es que el servidor o el mallado no dan abasto.
+    pub fn missing_near(&self, center: IVec3, radius: i32) -> usize {
+        let mut missing = 0;
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dz * dz > radius * radius {
+                    continue;
+                }
+                let ready = self
+                    .slots
+                    .get(&(center + IVec3::new(dx, 0, dz)))
+                    // Un chunk que se está remallando tras una edición sigue mostrando
+                    // su malla anterior: no es un hueco.
+                    .is_some_and(|slot| slot.mesh == MeshState::Done || slot.has_mesh);
+                missing += !ready as usize;
+            }
+        }
+        missing
+    }
+
     /// Altura aproximada del suelo en una columna, según el terreno lejano recibido.
     pub fn ground_height(&self, wx: i32, wz: i32) -> Option<i32> {
         [FINE, COARSE].into_iter().find_map(|level| {
@@ -528,6 +552,20 @@ mod tests {
         // En diagonal entra por la cara superior del suelo.
         let (block, before) = world.raycast(eye, Vec3::new(1.0, -1.0, 0.0), 8.0).unwrap();
         assert_eq!((block.y, before.y), (-1, 0));
+    }
+
+    #[test]
+    fn missing_near_counts_chunks_not_ready_to_draw() {
+        let mut world = flat_world();
+        let mut events = Vec::new();
+        // Nada mallado todavía: falta el propio chunk de la cámara.
+        assert_eq!(world.missing_near(IVec3::ZERO, 0), 1);
+        world.update(IVec3::ZERO, &mut events);
+        // El central (aire, con sus 26 vecinos) queda listo; los 8 de alrededor no pueden
+        // mallarse porque les faltan vecinos, y más lejos no hay nada recibido.
+        assert_eq!(world.missing_near(IVec3::ZERO, 0), 0);
+        assert_eq!(world.missing_near(IVec3::ZERO, 1), 4);
+        assert_eq!(world.missing_near(IVec3::new(5, 0, 0), 0), 1);
     }
 
     #[test]

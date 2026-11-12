@@ -36,6 +36,10 @@ const DEFAULT_FAR_DISTANCE: u8 = 32;
 const CLIP_FADE_ALTITUDE: (f32, f32) = (64.0, 112.0);
 /// Rapidez con la que los demás jugadores se acercan a su última posición conocida.
 const REMOTE_SMOOTHING: f32 = 14.0;
+/// Silencio del servidor que da por terminada la carga inicial.
+const INITIAL_LOAD_QUIET: Duration = Duration::from_millis(400);
+/// A partir de esta duración, un hueco en el terreno cercano se avisa en el registro.
+const NOTICEABLE_GAP: Duration = Duration::from_millis(250);
 
 /// Cómo se juega esta sesión.
 enum Mode {
@@ -167,8 +171,11 @@ struct State {
     last_frame: Instant,
     stats_since: Instant,
     stats_frames: u32,
-    /// Momento en que empezó la carga en curso; `None` cuando el mundo está al día.
+    /// Momento en que empezó la carga inicial; `None` cuando ya terminó.
     loading_since: Option<Instant>,
+    /// Hueco en curso en el terreno cercano: cuándo empezó y el máximo de chunks que
+    /// han llegado a faltar.
+    gap: Option<(Instant, usize)>,
     /// Desarrollo: vista inicial fija y captura al terminar de cargar.
     dev_camera: Option<[f64; 5]>,
     screenshot: Option<PathBuf>,
@@ -259,6 +266,7 @@ impl State {
             stats_since: now,
             stats_frames: 0,
             loading_since: Some(now),
+            gap: None,
             dev_camera,
             screenshot,
         })
@@ -529,36 +537,63 @@ impl State {
         }
     }
 
-    /// Registra cuánto tarda cada tanda de carga y dispara la captura de desarrollo.
+    /// Registro de la carga del mundo.
     ///
-    /// El cliente no sabe qué le falta por recibir, así que da el mundo por cargado
-    /// cuando no queda nada por mallar y el servidor lleva un momento sin enviar nada.
+    /// - La **carga inicial** se anuncia una vez (y dispara la captura de desarrollo). El
+    ///   cliente no sabe qué le falta por recibir, así que la da por terminada cuando no
+    ///   queda nada por mallar y el servidor lleva un momento sin enviar nada.
+    /// - Después solo se avisa de lo que el jugador puede notar: que el terreno cercano
+    ///   estuvo incompleto un rato (volando más rápido de lo que carga, por ejemplo).
+    ///   Editar bloques o cargar los bordes al andar no genera ningún aviso.
     fn track_loading(&mut self, now: Instant) {
-        let quiet = now - self.last_message;
-        let settled = self.session.is_some()
-            && self.world.is_idle()
-            && self.world.stats().chunks > 0
-            && quiet >= Duration::from_millis(400);
-        if !settled {
-            if quiet < Duration::from_millis(400) {
-                self.loading_since.get_or_insert(now);
+        let Some((_, view_distance)) = self.session else { return };
+
+        if let Some(since) = self.loading_since {
+            let quiet = now - self.last_message;
+            let settled = self.world.is_idle()
+                && self.world.stats().chunks > 0
+                && quiet >= INITIAL_LOAD_QUIET;
+            if !settled {
+                return;
+            }
+            self.loading_since = None;
+            let world = self.world.stats();
+            let render = self.renderer.stats();
+            log::info!(
+                "world loaded in {:.2} s: {} chunks, {} far tiles, {} meshes, {} quads",
+                (now - since).saturating_sub(quiet).as_secs_f32(),
+                world.chunks,
+                world.lod_tiles,
+                render.chunks,
+                render.quads,
+            );
+            if let Some(path) = self.screenshot.take() {
+                self.renderer.request_screenshot(path);
+                self.exit = true;
             }
             return;
         }
-        let Some(since) = self.loading_since.take() else { return };
-        let world = self.world.stats();
-        let render = self.renderer.stats();
-        log::info!(
-            "world up to date in {:.2} s: {} chunks, {} far tiles, {} meshes, {} quads",
-            (now - since - quiet).as_secs_f32(),
-            world.chunks,
-            world.lod_tiles,
-            render.chunks,
-            render.quads,
-        );
-        if let Some(path) = self.screenshot.take() {
-            self.renderer.request_screenshot(path);
-            self.exit = true;
+
+        // Tras la carga inicial: ¿falta terreno donde el jugador lo vería?
+        let missing = self.world.missing_near(self.camera.chunk_pos(), view_distance);
+        match (&mut self.gap, missing) {
+            (None, 0) => {}
+            (None, _) => self.gap = Some((now, missing)),
+            (Some((_, worst)), 1..) => *worst = (*worst).max(missing),
+            (Some((since, worst)), 0) => {
+                let lasted = now - *since;
+                let message = format!(
+                    "nearby terrain was incomplete for {:.2} s (up to {worst} chunks missing)",
+                    lasted.as_secs_f32()
+                );
+                // Un instante al cruzar un borde es normal; más ya se puede ver.
+                if lasted >= NOTICEABLE_GAP {
+                    log::warn!("{message}");
+                } else {
+                    log::debug!("{message}");
+                }
+                self.gap = None;
+            }
         }
     }
 
