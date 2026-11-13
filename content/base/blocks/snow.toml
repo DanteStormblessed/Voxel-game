@@ -1,2 +1,4 @@
 name = "Nieve"
 color = "#F5FAFF"
+category = "Terreno"
+tags = ["natural"]

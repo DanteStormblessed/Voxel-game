@@ -1,0 +1,6 @@
+name = "Flor roja"
+color = "#E8413C"          # color del ítem en la interfaz
+category = "Naturaleza"
+tags = ["natural", "flor"]
+model = "base:flower"      # content/base/models/flower.vox
+solid = false              # se atraviesa (pero se puede romper)

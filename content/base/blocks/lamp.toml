@@ -1,0 +1,5 @@
+name = "Lámpara"
+color = "#FFD46B"
+category = "Luz"
+# 0-15. Por ahora solo hace que el bloque brille (no ilumina alrededor).
+light = 15

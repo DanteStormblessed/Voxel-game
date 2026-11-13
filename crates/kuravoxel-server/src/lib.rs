@@ -8,6 +8,8 @@
 //! Bucle: los eventos (conexiones, mensajes, chunks recién generados) se atienden en
 //! cuanto llegan; la simulación avanza a ticks fijos de `TICK_RATE` por segundo.
 
+mod commands;
+mod drops;
 mod noise;
 pub mod quic;
 mod storage;
@@ -23,19 +25,23 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 
-use glam::{DVec3, IVec3};
+use glam::{DVec3, IVec3, Vec3};
 use rustc_hash::{FxHashMap, FxHashSet};
-use voxel_common::chunk::{Chunk, CHUNK_SIZE};
-use voxel_common::block::Block;
-use voxel_common::content::{self, BlockDef, ContentData};
-use voxel_common::lod::{self, LodTile, TileKey};
-use voxel_common::protocol::{
-    ClientMsg, PlayerId, PlayerState, ServerMsg, LOAD_MARGIN, PROTOCOL_VERSION, REACH, TICK_RATE,
+use kuravoxel_common::chunk::{Chunk, CHUNK_SIZE};
+use kuravoxel_common::physics::EYE_HEIGHT;
+use kuravoxel_common::block::Block;
+use kuravoxel_common::content::{self, ContentData, ItemId};
+use kuravoxel_common::shape::BlockTable;
+use kuravoxel_common::lod::{self, LodTile, TileKey};
+use kuravoxel_common::protocol::{
+    ClientMsg, DropState, PlayerId, PlayerState, ServerMsg, LOAD_MARGIN, PROTOCOL_VERSION, REACH, TICK_RATE,
     UNLOAD_MARGIN, VERTICAL_RADIUS,
 };
 
+use commands::Command;
 use storage::{Storage, WorldMeta};
-use world::World;
+use drops::Drops;
+use world::{World, WorldCollider};
 use worldgen::TerrainBlocks;
 
 /// Chunks que un jugador puede tener esperando generación a la vez. Acota el trabajo
@@ -78,10 +84,10 @@ impl Default for ServerConfig {
         Self {
             seed: 1337,
             world_dir: PathBuf::from("worlds").join("default"),
-            content_dir: std::env::var_os("VOXEL_CONTENT")
+            content_dir: std::env::var_os("KURAVOXEL_CONTENT")
                 .map_or_else(|| PathBuf::from("content"), PathBuf::from),
             max_view_distance: 16,
-            max_far_distance: 64,
+            max_far_distance: 160,
             trust_movement: false,
         }
     }
@@ -91,7 +97,7 @@ impl Default for ServerConfig {
 pub type Sink = Box<dyn Fn(ServerMsg) -> bool + Send>;
 
 pub enum Event {
-    Connect { id: PlayerId, sink: Sink },
+    Connect { id: PlayerId, sink: Sink, operator: bool },
     Message { id: PlayerId, msg: ClientMsg },
     Disconnect { id: PlayerId },
     Generated(IVec3, Chunk),
@@ -110,8 +116,18 @@ pub struct ServerHandle {
 impl ServerHandle {
     /// Registra una conexión nueva y devuelve su identificador.
     pub fn connect(&self, sink: Sink) -> PlayerId {
+        self.register(sink, false)
+    }
+
+    /// Como `connect`, pero la conexión puede ejecutar comandos de consola del servidor.
+    /// Es la del anfitrión: quien tiene el servidor en su propio proceso.
+    pub fn connect_operator(&self, sink: Sink) -> PlayerId {
+        self.register(sink, true)
+    }
+
+    fn register(&self, sink: Sink, operator: bool) -> PlayerId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = self.events.send(Event::Connect { id, sink });
+        let _ = self.events.send(Event::Connect { id, sink, operator });
         id
     }
 
@@ -138,26 +154,20 @@ pub fn start(config: ServerConfig) -> anyhow::Result<ServerHandle> {
     let fingerprint = content::fingerprint(dir);
     let (storage, meta) = Storage::open(&config.world_dir)?;
     // Los chunks guardados usan los números de bloque de cuando se guardaron: se parte de
-    // la tabla del mundo para que cada identificador conserve el suyo.
-    let known = meta.as_ref().map(|meta| ContentData {
-        blocks: meta
-            .blocks
-            .iter()
-            .map(|id| {
-                (!id.is_empty()).then(|| BlockDef {
-                    id: id.clone(),
-                    name: String::new(),
-                    color: [255, 0, 255],
-                    model: None,
-                })
-            })
-            .collect(),
-    });
-    let loaded = content::load_blocks(dir)
-        .and_then(|defs| ContentData::assign(defs, known.as_ref()))
+    // la tabla del mundo para que cada estado de bloque (y cada ítem) conserve el suyo.
+    let (known_states, known_items) =
+        meta.as_ref().map_or((Vec::new(), Vec::new()), |meta| (meta.blocks.clone(), meta.items.clone()));
+    let loaded = content::load(dir)
+        .and_then(|loaded| ContentData::assign(loaded, &known_states, &known_items))
         .with_context(|| format!("failed to load content from {}", dir.display()))?;
     let blocks = TerrainBlocks::resolve(&loaded)?;
-    log::info!("content: {} blocks from {}", loaded.block_count(), dir.display());
+    log::info!(
+        "content: {} blocks ({} states), {} items from {}",
+        loaded.block_count(),
+        loaded.numbered_states().count(),
+        loaded.item_count(),
+        dir.display()
+    );
 
     let seed = meta.as_ref().map_or(config.seed, |meta| meta.seed);
     storage.write_meta(&world_meta(seed, &loaded))?;
@@ -184,18 +194,13 @@ pub fn start(config: ServerConfig) -> anyhow::Result<ServerHandle> {
 }
 
 fn world_meta(seed: u32, content: &ContentData) -> WorldMeta {
-    WorldMeta {
-        seed,
-        blocks: content
-            .blocks
-            .iter()
-            .map(|block| block.as_ref().map_or(String::new(), |block| block.id.clone()))
-            .collect(),
-    }
+    WorldMeta { seed, blocks: content.state_names(), items: content.item_names() }
 }
 
 struct Player {
     sink: Sink,
+    /// Puede ejecutar comandos de consola del servidor.
+    operator: bool,
     /// `None` hasta que llega un `Hello` válido.
     session: Option<Session>,
     alive: bool,
@@ -239,8 +244,11 @@ struct Server {
     last_gc: Instant,
     last_save: Instant,
     content: Arc<ContentData>,
+    /// Propiedades por número de bloque del contenido actual (física de los ítems).
+    blocks: BlockTable,
     content_fingerprint: (usize, Option<SystemTime>),
     last_content_poll: Instant,
+    drops: Drops,
 }
 
 fn chunk_of(pos: DVec3) -> IVec3 {
@@ -285,8 +293,10 @@ impl Server {
             world,
             seed,
             last_save: Instant::now(),
+            blocks: BlockTable::new(&content),
             content,
             content_fingerprint,
+            drops: Drops::default(),
             last_content_poll: Instant::now(),
             config,
             inbox,
@@ -337,8 +347,8 @@ impl Server {
     /// Devuelve `false` para detener el servidor.
     fn handle(&mut self, event: Event) -> bool {
         match event {
-            Event::Connect { id, sink } => {
-                self.players.insert(id, Player { sink, session: None, alive: true });
+            Event::Connect { id, sink, operator } => {
+                self.players.insert(id, Player { sink, operator, session: None, alive: true });
             }
             Event::Message { id, msg } => self.on_message(id, msg),
             Event::Disconnect { id } => self.remove_player(id),
@@ -355,39 +365,36 @@ impl Server {
                 self.on_hello(id, version, name, view_distance, far_distance)
             }
             ClientMsg::SetBlock { pos, block } => {
-                let pos = IVec3::from_array(pos);
+                let (pos, block) = (IVec3::from_array(pos), Block(block));
                 let Some(session) = self.players.get(&id).and_then(|p| p.session.as_ref()) else {
                     return;
                 };
-                // Validación de autoridad: el bloque existe y está al alcance del jugador.
-                let known = block == 0
-                    || self.content.blocks.get(block as usize).is_some_and(|b| b.is_some());
                 let center = pos.as_dvec3() + DVec3::splat(0.5);
                 let in_reach = center.distance(session.pos) <= REACH + REACH_SLACK;
-                let applied = (known && in_reach)
-                    .then(|| self.world.set_block(pos, Block(block)))
-                    .flatten();
-                match applied {
-                    Some(chunk) => {
-                        let msg = || ServerMsg::BlockChange { pos: pos.to_array(), block };
-                        for player in self.players.values_mut() {
-                            let has_chunk =
-                                player.session.as_ref().is_some_and(|s| s.sent.contains(&chunk));
-                            if has_chunk {
-                                player.alive &= (player.sink)(msg());
+                let cells = self.edit_cells(pos, block);
+                match cells.filter(|_| in_reach) {
+                    Some(cells) => {
+                        for (pos, block) in cells {
+                            if let Some(chunk) = self.world.set_block(pos, block) {
+                                self.broadcast_block(pos, block, chunk);
                             }
                         }
                     }
-                    // Rechazada: se devuelve al cliente el bloque que hay de verdad.
+                    // Rechazada: se devuelve al cliente lo que hay de verdad en todas las
+                    // celdas que habrá cambiado al predecir.
                     None => {
-                        if let Some(actual) = self.world.block_at(pos) {
-                            self.send(id, ServerMsg::BlockChange { pos: pos.to_array(), block: actual.0 });
+                        let touched = if block == Block::AIR { vec![(pos, block)] } else { self.content.structure(block, pos) };
+                        for (pos, _) in touched {
+                            if let Some(actual) = self.world.block_at(pos) {
+                                self.send(id, ServerMsg::BlockChange { pos: pos.to_array(), block: actual.0 });
+                            }
                         }
                     }
                 }
             }
             ClientMsg::Move { pos, yaw, pitch } => {
                 let trust = self.config.trust_movement;
+                let bounds = self.world.generator.bounds();
                 let Some(player) = self.players.get_mut(&id) else { return };
                 let Some(session) = player.session.as_mut() else { return };
                 let pos = DVec3::from_array(pos);
@@ -399,6 +406,13 @@ impl Server {
                 let now = Instant::now();
                 let elapsed = (now - session.last_move).as_secs_f64().min(1.0);
                 let allowed = MAX_SPEED * elapsed + MOVE_SLACK;
+                if !bounds.contains(pos, MOVE_SLACK) {
+                    let inside = bounds.clamp(pos, 0.5);
+                    player.alive &= (player.sink)(ServerMsg::Teleport { pos: inside.to_array() });
+                    session.pos = inside;
+                    session.last_move = now;
+                    return;
+                }
                 if !trust && pos.distance(session.pos) > allowed {
                     player.alive &= (player.sink)(ServerMsg::Teleport { pos: session.pos.to_array() });
                     session.last_move = now;
@@ -408,6 +422,173 @@ impl Server {
                 session.yaw = yaw;
                 session.pitch = pitch.clamp(-1.6, 1.6);
                 session.last_move = now;
+            }
+            ClientMsg::DropItem { item, dir } => {
+                let Some(session) = self.players.get(&id).and_then(|p| p.session.as_ref()) else {
+                    return;
+                };
+                let dir = Vec3::from_array(dir).as_dvec3();
+                let item = ItemId(item);
+                if self.content.item(item).is_none() || !dir.is_finite() || dir.length_squared() < 1e-6 {
+                    return;
+                }
+                let eye = session.pos;
+                let (drop, evicted) = self.drops.throw(item, eye, dir);
+                let pos = self.drops.iter().find(|(d, _)| *d == drop).map(|(_, d)| d.body.pos).unwrap_or(eye);
+                self.broadcast(|| ServerMsg::DropSpawned { id: drop, item: item.0, pos: pos.to_array() });
+                if let Some(old) = evicted {
+                    self.broadcast(|| ServerMsg::DropRemoved { id: old });
+                }
+            }
+            ClientMsg::Command { line } => {
+                let (text, ok) = match self.run_command(id, &line) {
+                    Ok(text) => (text, true),
+                    Err(text) => (text, false),
+                };
+                self.send(id, ServerMsg::CommandOutput { text, ok });
+            }
+        }
+    }
+
+    /// Ejecuta una línea de consola en nombre de un jugador. Devuelve el texto que verá
+    /// en su consola; `Err` si el comando no se ejecutó.
+    fn run_command(&mut self, id: PlayerId, line: &str) -> Result<String, String> {
+        let player = self.players.get(&id).filter(|player| player.session.is_some());
+        let Some(player) = player else { return Err("Not in the world yet.".into()) };
+        if !player.operator {
+            return Err("Only the host of this world can run server commands.".into());
+        }
+        let command = commands::parse(line)?;
+        log::info!("command from #{id}: {}", line.trim());
+        // Las coordenadas relativas (`~`) parten de los ojos para `tp` y de los pies para
+        // los bloques.
+        let eye = player.session.as_ref().map_or(DVec3::ZERO, |session| session.pos);
+        let feet = eye - DVec3::new(0.0, EYE_HEIGHT, 0.0);
+        let block_named = |content: &ContentData, name: &str| {
+            if name == "air" {
+                return Ok(Block::AIR);
+            }
+            content.block_id(name).ok_or_else(|| {
+                format!("Unknown block '{name}'. Use names like base:stone or base:wood[axis=x].")
+            })
+        };
+        match command {
+            Command::Help => Ok(commands::HELP.join("\n")),
+            Command::Seed => Ok(format!("Seed: {}", self.seed)),
+            Command::Save => {
+                self.save_world();
+                Ok("World saved.".into())
+            }
+            Command::Players => {
+                let mut lines: Vec<String> = self
+                    .players
+                    .iter()
+                    .filter_map(|(id, player)| {
+                        let session = player.session.as_ref()?;
+                        let pos = session.pos;
+                        Some(format!(
+                            "#{id} {} at {:.0} {:.0} {:.0}",
+                            session.name, pos.x, pos.y, pos.z
+                        ))
+                    })
+                    .collect();
+                lines.sort();
+                Ok(lines.join("\n"))
+            }
+            Command::Teleport(pos) => {
+                let pos = commands::resolve(pos, eye);
+                // Ni siquiera el anfitrión sale de la zona jugable.
+                let pos = self.world.generator.bounds().clamp(pos, 0.5);
+                let Some(player) = self.players.get_mut(&id) else {
+                    return Err("Not in the world yet.".into());
+                };
+                if let Some(session) = player.session.as_mut() {
+                    // La autoridad cambia la posición y el cliente la adopta; los `Move`
+                    // que vinieran de camino se rechazan solos por la distancia.
+                    session.pos = pos;
+                    session.last_move = Instant::now();
+                }
+                player.alive &= (player.sink)(ServerMsg::Teleport { pos: pos.to_array() });
+                Ok(format!("Teleported to {:.1} {:.1} {:.1}", pos.x, pos.y, pos.z))
+            }
+            Command::SetBlock(pos, name) => {
+                let block = block_named(&self.content, &name)?;
+                let pos = commands::resolve_voxel(pos, feet);
+                let chunk = self
+                    .world
+                    .set_block(pos, block)
+                    .ok_or("That position is not loaded: get closer to it.")?;
+                self.broadcast_block(pos, block, chunk);
+                Ok(format!("Placed {name} at {} {} {}", pos.x, pos.y, pos.z))
+            }
+            Command::Fill(from, to, name) => {
+                let block = block_named(&self.content, &name)?;
+                let (a, b) = (commands::resolve_voxel(from, feet), commands::resolve_voxel(to, feet));
+                let (min, max) = (a.min(b), a.max(b));
+                let size = (max - min + IVec3::ONE).as_i64vec3();
+                let volume = (size.x * size.y * size.z) as u64;
+                if volume > commands::MAX_FILL {
+                    return Err(format!(
+                        "That box has {volume} blocks; the limit is {}.",
+                        commands::MAX_FILL
+                    ));
+                }
+                let filled = self.world.fill(min, max, block);
+                if filled.changed.is_empty() && filled.missing > 0 {
+                    return Err("That box is not loaded: get closer to it.".into());
+                }
+                // Cada chunk cambiado se reenvía entero a quien lo tenga.
+                for &pos in &filled.changed {
+                    let Some(chunk) = self.world.loaded_chunk(pos) else { continue };
+                    for player in self.players.values_mut() {
+                        if player.session.as_ref().is_some_and(|s| s.sent.contains(&pos)) {
+                            let msg = ServerMsg::Chunk { pos: pos.to_array(), chunk: chunk.clone() };
+                            player.alive &= (player.sink)(msg);
+                        }
+                    }
+                }
+                let mut text = format!("Filled {volume} blocks with {name}.");
+                if filled.missing > 0 {
+                    text += &format!(" {} chunks were not loaded and were skipped.", filled.missing);
+                }
+                Ok(text)
+            }
+        }
+    }
+
+    /// Qué cambia una edición de un jugador, o `None` si no es válida. Colocar pone el
+    /// objeto entero (las dos mitades de una puerta) y solo si todas sus celdas están
+    /// libres; romper una celda quita todo el objeto al que pertenece.
+    fn edit_cells(&self, pos: IVec3, block: Block) -> Option<Vec<(IVec3, Block)>> {
+        if block == Block::AIR {
+            let current = self.world.block_at(pos)?;
+            let cells = self
+                .content
+                .structure(current, pos)
+                .into_iter()
+                .filter(|&(cell, expected)| cell == pos || self.world.block_at(cell) == Some(expected))
+                .map(|(cell, _)| (cell, Block::AIR))
+                .collect();
+            return Some(cells);
+        }
+        // Solo se coloca la celda de anclaje: el resto lo pone el servidor.
+        let state = self.content.state(block)?;
+        if state.part != 0 {
+            return None;
+        }
+        let cells = self.content.structure(block, pos);
+        let free = cells.iter().all(|&(cell, _)| {
+            self.world.block_at(cell).is_some_and(|current| self.content.replaceable(current))
+        });
+        free.then_some(cells)
+    }
+
+    /// Avisa del cambio de un voxel a quien tenga su chunk.
+    fn broadcast_block(&mut self, pos: IVec3, block: Block, chunk: IVec3) {
+        let msg = || ServerMsg::BlockChange { pos: pos.to_array(), block: block.0 };
+        for player in self.players.values_mut() {
+            if player.session.as_ref().is_some_and(|s| s.sent.contains(&chunk)) {
+                player.alive &= (player.sink)(msg());
             }
         }
     }
@@ -433,7 +614,9 @@ impl Server {
         let far_distance = (far as i32).clamp(view_distance, self.config.max_far_distance as i32);
 
         let ground = self.world.generator.height_at(0, 0).max(0);
-        let spawn = DVec3::new(0.5, ground as f64 + 24.0, 0.5);
+        // Los ojos, con los pies sobre el terreno. Si justo ahí hay un árbol, la física
+        // del cliente saca al jugador hacia arriba.
+        let spawn = DVec3::new(0.5, ground as f64 + 1.0 + EYE_HEIGHT, 0.5);
 
         let load_order = self
             .load_orders
@@ -444,6 +627,7 @@ impl Server {
         player.alive &= (player.sink)(ServerMsg::Welcome {
             id,
             spawn: spawn.to_array(),
+            bounds: self.world.generator.bounds(),
             view_distance: view_distance as u8,
             far_distance: far_distance as u8,
         });
@@ -478,6 +662,24 @@ impl Server {
         for (other, other_name) in others {
             self.send(id, ServerMsg::PlayerJoined { id: other, name: other_name });
             self.send(other, ServerMsg::PlayerJoined { id, name: name.clone() });
+        }
+        // Los ítems que ya había sueltos.
+        let drops: Vec<ServerMsg> = self
+            .drops
+            .iter()
+            .map(|(drop, d)| ServerMsg::DropSpawned { id: drop, item: d.item.0, pos: d.body.pos.to_array() })
+            .collect();
+        for msg in drops {
+            self.send(id, msg);
+        }
+    }
+
+    /// Envía un mensaje a todos los jugadores que ya están en el mundo.
+    fn broadcast(&mut self, msg: impl Fn() -> ServerMsg) {
+        for player in self.players.values_mut() {
+            if player.session.is_some() {
+                player.alive &= (player.sink)(msg());
+            }
         }
     }
 
@@ -580,7 +782,7 @@ impl Server {
             let lod_pending = &session.lod_pending;
             let mut retired = Vec::new();
             session.lod_retiring.retain(|&key| {
-                let waiting = lod::family(key).iter().any(|k| lod_pending.contains(k));
+                let waiting = lod_pending.iter().any(|&k| lod::overlaps(k, key));
                 if !waiting {
                     retired.push(key);
                 }
@@ -607,9 +809,26 @@ impl Server {
         }
     }
 
-    /// Un paso de simulación: de momento, difundir el estado de los jugadores.
+    /// Un paso de simulación: ítems sueltos y difusión de jugadores e ítems en movimiento.
     fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+
+        let collider = WorldCollider { world: &self.world, blocks: &self.blocks };
+        let (moved, expired) = self.drops.step(Duration::from_secs(1) / TICK_RATE, &collider);
+        let feet: Vec<(PlayerId, DVec3)> = self
+            .players
+            .iter()
+            .filter_map(|(id, p)| p.session.as_ref().map(|s| (*id, s.pos - DVec3::new(0.0, EYE_HEIGHT, 0.0))))
+            .collect();
+        for (drop, item, player) in self.drops.pick_up(&feet) {
+            self.send(player, ServerMsg::PickedUp { item: item.0 });
+            self.broadcast(|| ServerMsg::DropRemoved { id: drop });
+        }
+        for drop in expired {
+            self.broadcast(|| ServerMsg::DropRemoved { id: drop });
+        }
+        let drops: Vec<DropState> =
+            moved.into_iter().map(|(id, pos)| DropState { id, pos: pos.to_array() }).collect();
 
         let states: Vec<PlayerState> = self
             .players
@@ -623,7 +842,7 @@ impl Server {
                 })
             })
             .collect();
-        if states.len() > 1 {
+        if states.len() > 1 || !drops.is_empty() {
             let tick = self.tick;
             for (id, player) in self.players.iter_mut() {
                 if player.session.is_none() {
@@ -632,8 +851,18 @@ impl Server {
                 let others: Vec<PlayerState> =
                     states.iter().filter(|s| s.id != *id).copied().collect();
                 for group in others.chunks(ENTITIES_PER_PACKET) {
-                    player.alive &=
-                        (player.sink)(ServerMsg::Entities { tick, players: group.to_vec() });
+                    player.alive &= (player.sink)(ServerMsg::Entities {
+                        tick,
+                        players: group.to_vec(),
+                        drops: Vec::new(),
+                    });
+                }
+                for group in drops.chunks(ENTITIES_PER_PACKET) {
+                    player.alive &= (player.sink)(ServerMsg::Entities {
+                        tick,
+                        players: Vec::new(),
+                        drops: group.to_vec(),
+                    });
                 }
             }
         }
@@ -672,17 +901,25 @@ impl Server {
         }
         self.content_fingerprint = fingerprint;
 
-        let reloaded = content::load_blocks(dir)
-            .and_then(|defs| ContentData::assign(defs, Some(&self.content)))
+        let reloaded = content::load(dir)
+            .and_then(|loaded| {
+                let (states, items) = (self.content.state_names(), self.content.item_names());
+                ContentData::assign(loaded, &states, &items)
+            })
             // El generador ya tiene resueltos sus bloques: no pueden desaparecer.
             .and_then(|data| TerrainBlocks::resolve(&data).map(|_| data));
         match reloaded {
             Ok(data) => {
-                log::info!("content reloaded: {} blocks", data.block_count());
+                log::info!(
+                    "content reloaded: {} blocks, {} items",
+                    data.block_count(),
+                    data.item_count()
+                );
                 // Los bloques nuevos tienen número nuevo: la tabla del mundo debe saberlo.
                 if let Err(error) = self.world.storage.write_meta(&world_meta(self.seed, &data)) {
                     log::error!("failed to update world.toml: {error:#}");
                 }
+                self.blocks = BlockTable::new(&data);
                 self.content = Arc::new(data);
                 for player in self.players.values_mut() {
                     if player.session.is_some() {
@@ -722,7 +959,8 @@ impl Server {
 
 /// Recalcula qué teselas de terreno lejano necesita el jugador.
 fn retarget_lod(session: &mut Session, center: IVec3) {
-    let fine_radius = (session.view_distance + 8).max(session.far_distance * 5 / 8);
+    // El nivel más fino llega siempre algo más allá de los voxeles reales.
+    let fine_radius = session.view_distance + 6;
     let desired = lod::desired_tiles(center.x, center.z, session.far_distance, fine_radius);
     let wanted: FxHashSet<TileKey> = desired.iter().copied().collect();
 

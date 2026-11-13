@@ -1,0 +1,7 @@
+name = "Poste"
+color = "#A9632B"
+category = "Construcción"
+tags = ["madera"]
+model = "base:fence_post"
+# Colisión más alta que el modelo, como en una valla: no se salta por encima.
+collision = [[3, 0, 3, 5, 8, 5]]

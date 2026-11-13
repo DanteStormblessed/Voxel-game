@@ -1,2 +1,4 @@
 name = "Arena"
 color = "#F3E3A2"
+category = "Terreno"
+tags = ["natural", "suelo"]

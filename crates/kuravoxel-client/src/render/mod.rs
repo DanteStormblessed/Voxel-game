@@ -1,7 +1,10 @@
 //! Renderer: dispositivo wgpu, superficie y pase de dibujo.
 
 mod entities;
+mod items;
 mod terrain;
+
+pub use items::ItemInstance;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,9 +13,11 @@ use glam::{DVec3, Vec3};
 use winit::window::Window;
 
 use crate::camera::{Camera, Frustum};
-use crate::mesher::ChunkMesh;
-use voxel_common::block::hex_to_linear;
-use voxel_common::chunk::CHUNK_SIZE;
+use crate::mesher::{ChunkMesh, MeshTable};
+use kuravoxel_common::content::{ContentData, ItemId};
+use kuravoxel_common::shape::BlockTable;
+use kuravoxel_common::block::hex_to_linear;
+use kuravoxel_common::chunk::CHUNK_SIZE;
 
 use entities::{EntityInstance, EntityRenderer};
 use crate::world::MeshKey;
@@ -31,13 +36,79 @@ const LOD_OVERLAP: f32 = 8.0;
 /// uniones en T entre quads vecinos y, sin este solape, el rasterizador abre en ellas
 /// agujeros de un píxel por los que se ve el cielo.
 const QUAD_GROW_PIXELS: f32 = 0.75;
+/// Radio del "planeta", en metros. El terreno baja `d² / 2R` con la distancia horizontal
+/// a la cámara: las montañas lejanas se hunden un poco y el borde del terreno cargado
+/// cae hacia el horizonte. Sutil a propósito (a 5 km baja ~60 m); más pequeño parece un
+/// planeta diminuto.
+const CURVATURE_RADIUS: f32 = 200_000.0;
+/// Perspectiva aérea: cuánto se tiñe del color del cielo lo que está en el borde del
+/// terreno visible, sin contar el fundido final. Lo cercano apenas cambia.
+const HAZE_STRENGTH: f32 = 0.45;
+/// Fracción de la distancia visible a partir de la que el terreno se funde del todo con
+/// el cielo, para que el borde de lo cargado no se vea como un corte.
+const HAZE_EDGE: f32 = 0.86;
+
+fn present_mode(vsync: bool) -> wgpu::PresentMode {
+    if vsync {
+        wgpu::PresentMode::AutoVsync
+    } else {
+        wgpu::PresentMode::AutoNoVsync
+    }
+}
 
 pub struct RenderSettings {
-    /// Radio total visible en chunks, terreno lejano incluido (la niebla se ajusta a él).
+    /// Radio total visible en chunks, terreno lejano incluido (la bruma se ajusta a él).
     pub far_distance: i32,
     pub vsync: bool,
     /// Permite leer el frame de vuelta para `request_screenshot` (solo desarrollo).
     pub allow_screenshots: bool,
+}
+
+/// Qué se dibuja de cada forma y desde dónde se mide la bruma.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneView {
+    /// Distancia horizontal a la cámara (m) hasta la que se dibujan voxeles reales.
+    pub clip: f32,
+    /// Alturas (m) entre las que hay voxeles reales; fuera, dibuja el terreno lejano.
+    pub voxel_band: [f64; 2],
+    /// Punto en el que se centra la vista (el jugador): la bruma se mide desde ahí, así
+    /// que en la vista de mapa el terreno del jugador se ve nítido aunque la cámara esté
+    /// a kilómetros.
+    pub focus: DVec3,
+}
+
+impl SceneView {
+    /// Sin voxeles reales: todo es terreno lejano.
+    pub fn empty(focus: DVec3) -> Self {
+        Self { clip: 0.0, voxel_band: [0.0, 0.0], focus }
+    }
+}
+
+/// Qué ha pasado con un frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameStatus {
+    Presented,
+    /// La superficie ya no vale (cambio de tamaño, etc.): hay que llamar a `reconfigure`.
+    Reconfigure,
+    /// No había dónde dibujar (ventana oculta, espera agotada): se prueba en el siguiente.
+    Skipped,
+}
+
+/// Dispositivo gráfico del motor, prestado a quien dibuja encima de la escena.
+#[derive(Clone, Copy)]
+pub struct Gpu<'a> {
+    pub adapter: &'a wgpu::Adapter,
+    pub device: &'a wgpu::Device,
+    pub queue: &'a wgpu::Queue,
+    /// Formato de la imagen final (la superficie de la ventana).
+    pub format: wgpu::TextureFormat,
+}
+
+/// Tamaño en píxeles de la imagen sobre la que se dibuja la interfaz.
+#[derive(Clone, Copy)]
+pub struct OverlayTarget {
+    pub width: u32,
+    pub height: u32,
 }
 
 pub struct RenderStats {
@@ -61,23 +132,30 @@ struct Globals {
     fog_color: [f32; 4],
     fog_params: [f32; 4],
     params: [f32; 4],
+    focus: [f32; 4],
+    voxel_band: [f32; 4],
 }
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
     globals_buffer: wgpu::Buffer,
+    globals_layout: wgpu::BindGroupLayout,
     globals_bind_group: wgpu::BindGroup,
-    palette_buffer: wgpu::Buffer,
+    /// Color de cada número de bloque: textura de `PALETTE_WIDTH` × filas, que crece si
+    /// el contenido no cabe.
+    palette: wgpu::Texture,
     terrain: TerrainRenderer,
     entities: EntityRenderer,
+    items: items::ItemRenderer,
     entity_scratch: Vec<EntityInstance>,
     fog_color: [f32; 4],
-    fog_start: f32,
-    fog_end: f32,
+    /// Distancia (m) hasta la que hay terreno: ahí la bruma termina de fundirlo con el cielo.
+    haze_distance: f32,
     draw_calls: u32,
     screenshot: Option<PathBuf>,
 }
@@ -128,11 +206,7 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: if settings.vsync {
-                wgpu::PresentMode::AutoVsync
-            } else {
-                wgpu::PresentMode::AutoNoVsync
-            },
+            present_mode: present_mode(settings.vsync),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -147,12 +221,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         // La paleta la rellena el servidor al conectar (`set_palette`).
-        let palette_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("palette"),
-            size: 256 * 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let palette = create_palette(&device, 1);
 
         let uniform_entry = |binding: u32, visibility: wgpu::ShaderStages| {
             wgpu::BindGroupLayoutEntry {
@@ -170,45 +239,44 @@ impl Renderer {
             label: Some("globals layout"),
             entries: &[
                 uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
-                uniform_entry(1, wgpu::ShaderStages::VERTEX),
-            ],
-        });
-        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("globals bind group"),
-            layout: &globals_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: globals_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
+                // Leer una textura en el vertex shader está dentro de los límites de GLES 3.
+                wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    resource: palette_buffer.as_entire_binding(),
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
             ],
         });
+        let globals_bind_group =
+            create_globals_bind_group(&device, &globals_layout, &globals_buffer, &palette);
 
         let terrain = TerrainRenderer::new(&device, &globals_layout, format, DEPTH_FORMAT);
         let entities = EntityRenderer::new(&device, &globals_layout, format, DEPTH_FORMAT);
+        let items = items::ItemRenderer::new(&device, &globals_layout, format, DEPTH_FORMAT);
 
-        // La niebla termina justo antes del borde del terreno lejano.
-        let fog_end = ((settings.far_distance - 1).max(2) * CHUNK_SIZE as i32) as f32;
 
         Ok(Self {
             surface,
+            adapter,
             device,
             queue,
             config,
             depth_view,
             globals_buffer,
+            globals_layout,
             globals_bind_group,
-            palette_buffer,
+            palette,
             terrain,
             entities,
+            items,
             entity_scratch: Vec::new(),
             fog_color: hex_to_linear(SKY_COLOR),
-            fog_start: fog_end * 0.45,
-            fog_end,
+            haze_distance: haze_distance(settings.far_distance),
             draw_calls: 0,
             screenshot: None,
         })
@@ -229,16 +297,66 @@ impl Renderer {
         self.depth_view = create_depth_view(&self.device, &self.config);
     }
 
-    /// Colores de los bloques (RGBA lineal), indexados por número de bloque.
-    pub fn set_palette(&mut self, palette: &[[f32; 4]; 256]) {
-        self.queue
-            .write_buffer(&self.palette_buffer, 0, bytemuck::cast_slice(&palette[..]));
+    /// Activa o desactiva la sincronización vertical sin recrear nada más.
+    pub fn set_vsync(&mut self, vsync: bool) {
+        let mode = present_mode(vsync);
+        if self.config.present_mode != mode {
+            self.config.present_mode = mode;
+            self.reconfigure();
+        }
     }
 
-    /// Ajusta la niebla al radio total visible (lo concede el servidor al conectar).
+    /// Acceso al dispositivo gráfico para quien dibuje encima de la escena (la interfaz).
+    pub fn gpu(&self) -> Gpu<'_> {
+        Gpu {
+            adapter: &self.adapter,
+            device: &self.device,
+            queue: &self.queue,
+            format: self.config.format,
+        }
+    }
+
+    /// Olvida todo lo que se estaba dibujando del mundo (al salir de una partida).
+    pub fn clear_world(&mut self) {
+        self.terrain.clear();
+        self.entities.set(&self.queue, &[]);
+        self.items.clear();
+    }
+
+    /// Paleta de GPU (RGBA8 sRGB): ver `mesher::build_tables`.
+    pub fn set_palette(&mut self, palette: &[[u8; 4]]) {
+        let rows = (palette.len() as u32).div_ceil(PALETTE_WIDTH).max(1);
+        if rows > self.palette.height() {
+            self.palette = create_palette(&self.device, rows);
+            self.globals_bind_group = create_globals_bind_group(
+                &self.device,
+                &self.globals_layout,
+                &self.globals_buffer,
+                &self.palette,
+            );
+        }
+        let mut texels = palette.to_vec();
+        texels.resize((rows * PALETTE_WIDTH) as usize, [0; 4]);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.palette,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(PALETTE_WIDTH * 4),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d { width: PALETTE_WIDTH, height: rows, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Ajusta la bruma al radio total visible (lo concede el servidor al conectar).
     pub fn set_far_distance(&mut self, chunks: i32) {
-        self.fog_end = ((chunks - 1).max(2) * CHUNK_SIZE as i32) as f32;
-        self.fog_start = self.fog_end * 0.45;
+        self.haze_distance = haze_distance(chunks);
     }
 
     /// Entidades a dibujar este frame: jugadores (posición de los ojos, yaw, id) y cajas
@@ -260,6 +378,20 @@ impl Renderer {
             self.entity_scratch.push(EntityInstance::cuboid(rel, size, color));
         }
         self.entities.set(&self.queue, &self.entity_scratch);
+    }
+
+    /// Formas 3D de los ítems del contenido, para dibujarlos sueltos.
+    pub fn set_item_shapes(&mut self, content: &ContentData, blocks: &BlockTable, mesh: &MeshTable) {
+        self.items.set_shapes(&self.device, content, blocks, mesh);
+    }
+
+    /// Ítems sueltos de este frame: (ítem, centro de su base, giro).
+    pub fn set_drops(&mut self, camera: &Camera, drops: impl Iterator<Item = (ItemId, DVec3, f32)>) {
+        let origin = camera.chunk_pos().as_dvec3() * CHUNK_SIZE as f64;
+        let instances: Vec<ItemInstance> = drops
+            .map(|(item, base, spin)| ItemInstance { item, base: (base - origin).as_vec3(), spin })
+            .collect();
+        self.items.set(&self.queue, &instances);
     }
 
     pub fn upload_chunk(&mut self, key: MeshKey, mesh: &ChunkMesh) {
@@ -288,10 +420,28 @@ impl Renderer {
         }
     }
 
-    /// `clip` es la distancia horizontal (en voxeles) hasta la que se dibujan los voxeles
-    /// reales; a partir de ahí toma el relevo el terreno lejano.
-    pub fn render(&mut self, camera: &Camera, clip: f32) -> Result<(), wgpu::SurfaceError> {
-        let frame = self.surface.get_current_texture()?;
+    /// `scene` dice dónde hay voxeles reales (el resto lo dibuja el terreno lejano) y
+    /// desde dónde se mide la bruma.
+    ///
+    /// `overlay` se llama con la escena ya dibujada y recibe la imagen final: es donde la
+    /// interfaz pinta encima. El renderer no sabe nada de interfaces.
+    pub fn render(
+        &mut self,
+        camera: &Camera,
+        scene: &SceneView,
+        overlay: &mut dyn FnMut(&wgpu::TextureView, OverlayTarget),
+    ) -> FrameStatus {
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                return FrameStatus::Reconfigure;
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                log::error!("the GPU is out of memory");
+                return FrameStatus::Skipped;
+            }
+            Err(_) => return FrameStatus::Skipped,
+        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -300,6 +450,13 @@ impl Renderer {
         let view_proj = camera.view_proj(aspect);
         let cam_chunk = camera.chunk_pos();
         let cam_local = camera.local_pos();
+        let origin = cam_chunk.as_dvec3() * CHUNK_SIZE as f64;
+        let focus = (scene.focus - origin).as_vec3();
+        let clip = scene.clip;
+        let band = [
+            (scene.voxel_band[0] - origin.y) as f32,
+            (scene.voxel_band[1] - origin.y) as f32,
+        ];
         let sun_dir = Vec3::new(0.45, 0.8, 0.35).normalize();
         // Ángulo que cubre un píxel: tamaño en mundo de un píxel a distancia 1.
         let pixel_angle = 2.0 * (camera.fov_y * 0.5).tan() / self.config.height as f32;
@@ -314,12 +471,14 @@ impl Renderer {
             ground_ambient: [0.20, 0.19, 0.17, 0.0],
             fog_color: self.fog_color,
             fog_params: [
-                self.fog_start,
-                1.0 / (self.fog_end - self.fog_start),
+                self.haze_distance,
+                1.0 / (2.0 * CURVATURE_RADIUS),
                 LOD_OVERLAP,
-                0.0,
+                HAZE_EDGE,
             ],
             params: [BEVEL_RADIUS, AO_MIN, pixel_angle * QUAD_GROW_PIXELS, clip],
+            focus: [focus.x, focus.y, focus.z, HAZE_STRENGTH],
+            voxel_band: [band[0], band[1], 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
@@ -330,7 +489,9 @@ impl Renderer {
                 cam_chunk,
                 cam_local,
                 clip,
+                band,
                 LOD_OVERLAP,
+                CURVATURE_RADIUS,
             );
 
         let mut encoder = self
@@ -367,8 +528,18 @@ impl Renderer {
             });
             self.draw_calls = self.terrain.draw(&mut pass, &self.globals_bind_group);
             self.entities.draw(&mut pass, &self.globals_bind_group);
+            self.draw_calls += self.items.draw(&mut pass, &self.globals_bind_group);
+            // Lo translúcido al final, sobre todo lo opaco (jugadores incluidos).
+            self.draw_calls += self.terrain.draw_translucent(&mut pass, &self.globals_bind_group);
         }
 
+        // La escena se envía antes de que la interfaz pinte encima con sus propios comandos.
+        self.queue.submit(Some(encoder.finish()));
+        overlay(&view, OverlayTarget { width: self.config.width, height: self.config.height });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let capture = self.screenshot.take().map(|path| {
             let bytes_per_row =
                 (self.config.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
@@ -410,7 +581,7 @@ impl Renderer {
             }
         }
         frame.present();
-        Ok(())
+        FrameStatus::Presented
     }
 
     fn save_capture(
@@ -421,7 +592,7 @@ impl Renderer {
     ) -> anyhow::Result<()> {
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::PollType::Wait)?;
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
         let data = slice.get_mapped_range();
 
         let (width, height) = (self.config.width as usize, self.config.height as usize);
@@ -446,6 +617,41 @@ impl Renderer {
     }
 }
 
+/// Ancho de la textura de paleta: la entrada `n` está en (n % ancho, n / ancho). Con 8
+/// entradas por bloque, 65 536 bloques caben en 256 filas. Debe coincidir con el shader.
+const PALETTE_WIDTH: u32 = 2048;
+
+fn create_palette(device: &wgpu::Device, rows: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("palette"),
+        size: wgpu::Extent3d { width: PALETTE_WIDTH, height: rows, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        // sRGB: el shader recibe el color ya en lineal, que es como ilumina.
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn create_globals_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    globals: &wgpu::Buffer,
+    palette: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let view = palette.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("globals bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+        ],
+    })
+}
+
 fn create_depth_view(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
@@ -466,4 +672,10 @@ fn create_depth_view(
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Distancia de la bruma para un radio visible de `chunks`: termina justo antes del borde
+/// del terreno lejano.
+fn haze_distance(chunks: i32) -> f32 {
+    ((chunks - 1).max(2) * CHUNK_SIZE as i32) as f32
 }

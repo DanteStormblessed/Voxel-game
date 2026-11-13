@@ -1,22 +1,17 @@
 [package]
-name = "voxel-server"
+name = "kuravoxel-server"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-voxel-common.workspace = true
+kuravoxel-common.workspace = true
 glam.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
 anyhow.workspace = true
 log.workspace = true
-env_logger.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 serde.workspace = true
 postcard.workspace = true
 toml.workspace = true
-
-[[bin]]
-name = "voxel-server"
-path = "src/main.rs"

@@ -1,2 +1,4 @@
 name = "Piedra"
 color = "#9CA3AD"
+category = "Terreno"
+tags = ["natural", "roca"]

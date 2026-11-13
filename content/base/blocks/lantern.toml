@@ -1,0 +1,5 @@
+name = "Farol"
+color = "#FFD46B"
+category = "Luz"
+model = "base:lantern"
+light = 12

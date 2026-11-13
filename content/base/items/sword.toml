@@ -1,0 +1,11 @@
+# Ítem con modelo propio, mayor que un bloque (3×16×1 mini-voxeles = 2 m). Se ve en su
+# icono y al tirarlo al suelo (a la mitad de tamaño); aún no en la mano.
+name = "Espada"
+color = "#D7DEE6"
+category = "Armas"
+model = "base:sword"
+max_stack = 1
+
+# Icono generado desde el modelo: de frente (sin inclinar ni girar) y en diagonal.
+[icon]
+rotation = [0, 0, 45]

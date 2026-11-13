@@ -1,12 +1,10 @@
-use std::f32::consts::TAU;
-
 use glam::{DVec3, IVec3, Mat4, Vec3, Vec4};
 
-use voxel_common::chunk::CHUNK_SIZE;
+use kuravoxel_common::chunk::CHUNK_SIZE;
 
 const CHUNK_F64: f64 = CHUNK_SIZE as f64;
-const MOUSE_SENSITIVITY: f32 = 0.0022;
-const BOOST: f32 = 8.0;
+/// Radianes de giro por unidad de movimiento del ratón, con sensibilidad 1.
+pub const MOUSE_SENSITIVITY: f32 = 0.0022;
 
 /// Estado de entrada acumulado entre frames.
 #[derive(Default)]
@@ -15,17 +13,21 @@ pub struct Input {
     pub back: bool,
     pub left: bool,
     pub right: bool,
+    /// Saltar, o subir volando.
     pub up: bool,
+    /// Bajar volando.
     pub down: bool,
-    pub boost: bool,
+    /// Correr, o volar deprisa.
+    pub sprint: bool,
     pub mouse_dx: f32,
     pub mouse_dy: f32,
 }
 
-/// Cámara libre.
+/// Punto de vista desde el que se dibuja. Dónde se coloca lo decide `player`.
 ///
 /// La posición vive en f64 y a la GPU solo llega relativa al chunk de la cámara, así
 /// que la precisión es la misma en el origen que a millones de voxeles de distancia.
+#[derive(Clone)]
 pub struct Camera {
     pub pos: DVec3,
     /// 0 mira hacia -Z; crece girando a la derecha.
@@ -33,8 +35,6 @@ pub struct Camera {
     pub pitch: f32,
     pub fov_y: f32,
     pub near: f32,
-    /// Voxeles por segundo.
-    pub speed: f32,
 }
 
 impl Camera {
@@ -45,28 +45,7 @@ impl Camera {
             pitch: -0.3,
             fov_y: 70f32.to_radians(),
             near: 0.1,
-            speed: 14.0,
         }
-    }
-
-    pub fn update(&mut self, input: &mut Input, dt: f32) {
-        self.yaw = (self.yaw + input.mouse_dx * MOUSE_SENSITIVITY).rem_euclid(TAU);
-        self.pitch = (self.pitch - input.mouse_dy * MOUSE_SENSITIVITY).clamp(-1.55, 1.55);
-        input.mouse_dx = 0.0;
-        input.mouse_dy = 0.0;
-
-        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
-        let forward = Vec3::new(sin_yaw, 0.0, -cos_yaw);
-        let right = Vec3::new(cos_yaw, 0.0, sin_yaw);
-        let axis = |positive: bool, negative: bool| (positive as i32 - negative as i32) as f32;
-
-        let mut direction = (forward * axis(input.forward, input.back)
-            + right * axis(input.right, input.left))
-        .normalize_or_zero();
-        direction.y = axis(input.up, input.down);
-
-        let speed = self.speed * if input.boost { BOOST } else { 1.0 };
-        self.pos += (direction * speed * dt).as_dvec3();
     }
 
     pub fn forward(&self) -> Vec3 {

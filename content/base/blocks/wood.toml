@@ -1,2 +1,10 @@
 name = "Madera"
 color = "#A9632B"
+category = "Naturaleza"
+tags = ["natural", "madera"]
+# Tronco: se tumba según la cara sobre la que se coloca (axis=x|y|z).
+orientation = "axis"
+
+[faces]
+top = "#D8A266"     # anillos
+bottom = "#D8A266"

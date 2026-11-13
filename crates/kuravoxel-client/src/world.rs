@@ -9,11 +9,13 @@ use std::sync::Arc;
 
 use glam::{DVec3, IVec3, Vec3};
 use rustc_hash::FxHashMap;
-use voxel_common::block::Block;
-use voxel_common::chunk::{Chunk, CHUNK_BITS, CHUNK_SIZE_I};
-use voxel_common::lod::{self, LodTile, TileKey, COARSE, FINE, TILE_CELLS};
+use kuravoxel_common::block::Block;
+use kuravoxel_common::chunk::{Chunk, CHUNK_BITS, CHUNK_SIZE_I};
+use kuravoxel_common::lod::{self, LodTile, TileKey, MAX_LEVEL, MIN_LEVEL, TILE_CELLS};
+use kuravoxel_common::physics::{Collider, Shape};
+use kuravoxel_common::shape::{BlockProps, BlockTable};
 
-use crate::mesher::{self, ChunkMesh, Neighborhood};
+use crate::mesher::{self, ChunkMesh, MeshTable, Neighborhood};
 
 /// Mallas nuevas que se entregan al renderer como mucho por frame.
 const MESH_UPLOADS_PER_FRAME: usize = 24;
@@ -104,6 +106,11 @@ pub struct World {
     tiles: FxHashMap<TileKey, Tile>,
     lod_in_flight: usize,
     lod_dirty: bool,
+
+    /// Propiedades de cada número de bloque (física, rayo) y su versión para el mallador.
+    /// Llegan con el contenido; hasta entonces todo lo que no es aire es un cubo sólido.
+    blocks: Arc<BlockTable>,
+    mesh_table: Arc<MeshTable>,
 }
 
 impl World {
@@ -148,6 +155,31 @@ impl World {
             tiles: FxHashMap::default(),
             lod_in_flight: 0,
             lod_dirty: false,
+            blocks: Arc::default(),
+            mesh_table: Arc::default(),
+        }
+    }
+
+    /// Propiedades de los bloques del contenido actual.
+    pub fn blocks(&self) -> &BlockTable {
+        &self.blocks
+    }
+
+    /// Nuevas tablas de bloques (al recibir contenido). Si cambian formas o
+    /// transparencias, todos los chunks se vuelven a mallar; si solo cambian colores,
+    /// basta con la paleta.
+    pub fn set_tables(&mut self, blocks: Arc<BlockTable>, mesh_table: Arc<MeshTable>) {
+        let remesh = !self.mesh_table.same_geometry(&mesh_table);
+        self.blocks = blocks;
+        self.mesh_table = mesh_table;
+        if remesh {
+            for (&pos, slot) in self.slots.iter_mut() {
+                slot.version += 1;
+                slot.mesh = MeshState::None;
+                if slot.ready_neighbors == 26 {
+                    self.mesh_queue.push_back(pos);
+                }
+            }
         }
     }
 
@@ -197,7 +229,7 @@ impl World {
 
     /// Altura aproximada del suelo en una columna, según el terreno lejano recibido.
     pub fn ground_height(&self, wx: i32, wz: i32) -> Option<i32> {
-        [FINE, COARSE].into_iter().find_map(|level| {
+        (MIN_LEVEL..=MAX_LEVEL).find_map(|level| {
             let cell = 1i32 << level;
             let span = CHUNK_SIZE_I * cell;
             let tile = self.tiles.get(&(level, wx.div_euclid(span), wz.div_euclid(span)))?;
@@ -210,7 +242,19 @@ impl World {
     // --- Mensajes del servidor -------------------------------------------------------
 
     pub fn insert_chunk(&mut self, pos: IVec3, chunk: Arc<Chunk>) {
-        if self.slots.contains_key(&pos) {
+        // Un chunk que ya se tenía llega de nuevo cuando el servidor lo cambia en bloque
+        // (`fill`): se sustituye y se vuelve a mallar con sus vecinos.
+        if let Some(slot) = self.slots.get_mut(&pos) {
+            slot.chunk = chunk;
+            for offset in self.neighbors.into_iter().chain([IVec3::ZERO]) {
+                if let Some(slot) = self.slots.get_mut(&(pos + offset)) {
+                    slot.version += 1;
+                    slot.mesh = MeshState::None;
+                    if slot.ready_neighbors == 26 {
+                        self.mesh_queue.push_front(pos + offset);
+                    }
+                }
+            }
             return;
         }
         let mut ready = 0u8;
@@ -293,9 +337,35 @@ impl World {
         }
     }
 
-    /// Primer bloque sólido en la dirección de la mirada. Devuelve su posición y la del
-    /// hueco inmediatamente anterior (donde se colocaría un bloque nuevo).
+    /// Primer bloque que se puede editar en la dirección de la mirada (atraviesa el agua,
+    /// no las flores). Devuelve su posición y la del hueco inmediatamente anterior (donde
+    /// se colocaría un bloque nuevo).
     pub fn raycast(&self, origin: DVec3, direction: Vec3, reach: f64) -> Option<(IVec3, IVec3)> {
+        self.raycast_hit(origin, direction, reach, |props| props.targetable)
+            .map(|(voxel, previous, _)| (voxel, previous))
+    }
+
+    /// Distancia desde `origin` hasta el primer bloque opaco en esa dirección, si lo hay
+    /// antes de `reach`. Sirve para que la cámara en tercera persona no atraviese paredes.
+    pub fn raycast_distance(&self, origin: DVec3, direction: Vec3, reach: f64) -> Option<f64> {
+        self.raycast_hit(origin, direction, reach, |props| props.opaque)
+            .map(|(_, _, distance)| distance)
+    }
+
+    /// El voxel tapa la vista (cubo opaco o aún sin recibir).
+    pub fn is_opaque(&self, voxel: IVec3) -> bool {
+        self.block_at(voxel).is_none_or(|block| self.blocks.get(block).opaque)
+    }
+
+    /// Como `raycast`, con la distancia recorrida hasta entrar en el bloque. Si el origen
+    /// ya está dentro de un bloque sólido no hay resultado.
+    fn raycast_hit(
+        &self,
+        origin: DVec3,
+        direction: Vec3,
+        reach: f64,
+        stops: impl Fn(&BlockProps) -> bool,
+    ) -> Option<(IVec3, IVec3, f64)> {
         let direction = direction.as_dvec3().normalize_or_zero();
         if direction == DVec3::ZERO {
             return None;
@@ -313,9 +383,10 @@ impl World {
         }
 
         let mut previous = voxel;
+        let mut travelled = 0.0;
         loop {
-            if self.block_at(voxel).is_some_and(|block| block.is_solid()) {
-                return (voxel != previous).then_some((voxel, previous));
+            if self.block_at(voxel).is_some_and(|block| stops(self.blocks.get(block))) {
+                return (voxel != previous).then_some((voxel, previous, travelled));
             }
             let axis = if t_max.x <= t_max.y && t_max.x <= t_max.z {
                 0
@@ -328,6 +399,7 @@ impl World {
                 return None;
             }
             previous = voxel;
+            travelled = t_max[axis];
             voxel[axis] += step[axis];
             t_max[axis] += delta[axis];
         }
@@ -335,7 +407,7 @@ impl World {
 
     pub fn insert_lod(&mut self, data: Arc<LodTile>, events: &mut Vec<WorldEvent>) {
         let key = data.key;
-        if key.0 != FINE && key.0 != COARSE {
+        if !lod::is_valid_level(key.0) {
             return;
         }
         // Si ya existía (el servidor la reenvía), la versión nueva la sustituye.
@@ -419,7 +491,7 @@ impl World {
             }
             let Ok(hood) = Neighborhood::try_from(chunks) else { continue };
 
-            if mesher::is_trivially_empty(&hood) {
+            if mesher::is_trivially_empty(&hood, &self.mesh_table) {
                 self.finish_empty(pos, events);
                 continue;
             }
@@ -429,8 +501,9 @@ impl World {
             }
             self.mesh_in_flight += 1;
             let tx = self.mesh_tx.clone();
+            let table = self.mesh_table.clone();
             self.pool.spawn(move || {
-                let mesh = mesher::mesh_chunk(&hood);
+                let mesh = mesher::mesh_chunk(&hood, &table);
                 let _ = tx.send((pos, version, mesh));
             });
         }
@@ -491,18 +564,21 @@ impl World {
             return;
         }
         self.lod_dirty = false;
-        // Una tesela en retirada desaparece cuando las que la sustituyen (sus hijas o su
-        // madre) están ya malladas; así nunca queda un hueco al cambiar de nivel.
+        // Una tesela en retirada desaparece cuando las que la sustituyen (las de otros
+        // niveles que cubren su terreno) están ya malladas; así nunca queda un hueco al
+        // cambiar de nivel.
         let obsolete: Vec<TileKey> = self
             .tiles
             .iter()
             .filter(|(_, tile)| tile.retiring)
             .map(|(key, _)| *key)
-            .filter(|key| {
-                lod::family(*key)
-                    .iter()
-                    .filter_map(|relative| self.tiles.get(relative))
-                    .all(|relative| relative.ready || relative.retiring)
+            .filter(|&key| {
+                self.tiles.iter().all(|(&other, relative)| {
+                    other == key
+                        || !lod::overlaps(other, key)
+                        || relative.ready
+                        || relative.retiring
+                })
             })
             .collect();
         for key in obsolete {
@@ -517,6 +593,17 @@ impl World {
                     key: MeshKey { level: key.0, pos: IVec3::new(key.1, y, key.2) },
                 });
             }
+        }
+    }
+}
+
+/// La física choca contra la copia local del mundo. Lo que aún no se ha recibido cuenta
+/// como sólido, para no caer por un borde que todavía no ha llegado.
+impl Collider for World {
+    fn shape(&self, voxel: IVec3) -> Shape<'_> {
+        match self.block_at(voxel) {
+            None => Shape::Full,
+            Some(block) => self.blocks.get(block).collision.shape(),
         }
     }
 }
@@ -549,6 +636,7 @@ mod tests {
         // Demasiado lejos, o mirando al cielo: nada.
         assert_eq!(world.raycast(eye, Vec3::NEG_Y, 2.0), None);
         assert_eq!(world.raycast(eye, Vec3::Y, 8.0), None);
+        assert_eq!(world.raycast_distance(eye, Vec3::NEG_Y, 8.0), Some(2.5));
         // En diagonal entra por la cara superior del suelo.
         let (block, before) = world.raycast(eye, Vec3::new(1.0, -1.0, 0.0), 8.0).unwrap();
         assert_eq!((block.y, before.y), (-1, 0));

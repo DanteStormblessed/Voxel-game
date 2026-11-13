@@ -17,25 +17,74 @@ use anyhow::Context;
 use glam::IVec3;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use voxel_common::chunk::Chunk;
+use kuravoxel_common::block::Block;
+use kuravoxel_common::chunk::{rle_decode, Chunk};
 
 /// Chunks por lado de una región (como desplazamiento de bits).
 const REGION_BITS: i32 = 3;
-const REGION_FORMAT: u32 = 1;
+/// 1: bloques de 8 bits y chunks densos sin paleta (se convierten al leerlos).
+/// 2: bloques de 16 bits y paleta por chunk.
+const REGION_FORMAT: u32 = 2;
 
 /// Contenido de `world.toml`.
 #[derive(Serialize, Deserialize)]
 pub struct WorldMeta {
     pub seed: u32,
-    /// Identificador de bloque de cada número (el índice). Los chunks guardados usan
-    /// estos números, así que la tabla debe conservarse entre sesiones. El 0 es aire.
+    /// Nombre del estado de bloque de cada número (el índice), como `base:stone` o
+    /// `base:wood[axis=x]`. Los chunks guardados usan estos números, así que la tabla
+    /// debe conservarse entre sesiones. El 0 es aire.
     pub blocks: Vec<String>,
+    /// Identificador de cada ítem, por índice. No lo usan los chunks, pero así los
+    /// índices no cambian entre sesiones.
+    #[serde(default)]
+    pub items: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct RegionFile {
     format: u32,
-    chunks: Vec<([i32; 3], Arc<Chunk>)>,
+    chunks: RegionChunks,
+}
+
+type RegionChunks = Vec<([i32; 3], Arc<Chunk>)>;
+
+/// Chunk tal como se guardaba en el formato 1: un byte por voxel.
+#[derive(Deserialize)]
+enum LegacyChunk {
+    Uniform(u8),
+    Rle(Vec<(u16, u8)>),
+}
+
+impl LegacyChunk {
+    fn upgrade(self) -> anyhow::Result<Chunk> {
+        Ok(match self {
+            LegacyChunk::Uniform(block) => Chunk::Uniform(Block(block as u16)),
+            LegacyChunk::Rle(runs) => {
+                let mut bytes = vec![0u8; kuravoxel_common::chunk::CHUNK_VOLUME];
+                anyhow::ensure!(rle_decode(&runs, &mut bytes), "chunk has the wrong size");
+                let mut data = Chunk::new_dense_buffer();
+                for (out, &byte) in data.iter_mut().zip(&bytes) {
+                    *out = Block(byte as u16);
+                }
+                Chunk::from_dense(data)
+            }
+        })
+    }
+}
+
+/// Lee un archivo de región de cualquier formato conocido. Los números de bloque no
+/// cambian entre formatos (los fija `world.toml`), solo cómo se guardan.
+fn decode_region(bytes: &[u8]) -> anyhow::Result<RegionChunks> {
+    // `RegionFile` empieza por el formato: se lee primero y se decide cómo seguir.
+    let (format, rest) = postcard::take_from_bytes::<u32>(bytes)?;
+    match format {
+        REGION_FORMAT => Ok(postcard::from_bytes::<RegionChunks>(rest)?),
+        1 => postcard::from_bytes::<Vec<([i32; 3], LegacyChunk)>>(rest)?
+            .into_iter()
+            .map(|(pos, chunk)| Ok((pos, Arc::new(chunk.upgrade()?))))
+            .collect(),
+        other => anyhow::bail!("unknown region format {other}"),
+    }
 }
 
 #[derive(Default)]
@@ -94,20 +143,14 @@ impl Storage {
             if path.exists() {
                 let loaded = std::fs::read(&path)
                     .map_err(anyhow::Error::from)
-                    .and_then(|bytes| Ok(postcard::from_bytes::<RegionFile>(&bytes)?));
+                    .and_then(|bytes| decode_region(&bytes));
                 match loaded {
-                    Ok(file) if file.format == REGION_FORMAT => {
-                        region.chunks = file
-                            .chunks
+                    Ok(chunks) => {
+                        region.chunks = chunks
                             .into_iter()
                             .map(|(pos, chunk)| (IVec3::from_array(pos), chunk))
                             .collect();
                     }
-                    Ok(file) => log::error!(
-                        "{}: unknown region format {}, ignoring it",
-                        path.display(),
-                        file.format
-                    ),
                     // No se pisa un archivo que no se ha podido leer: se aparta.
                     Err(error) => {
                         log::error!("{}: unreadable region, set aside: {error:#}", path.display());
@@ -153,5 +196,38 @@ impl Storage {
             written += 1;
         }
         Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_regions_are_upgraded() {
+        #[derive(Serialize)]
+        enum OldChunk {
+            Uniform(u8),
+            Rle(Vec<(u16, u8)>),
+        }
+        let half = kuravoxel_common::chunk::CHUNK_VOLUME as u16 / 2;
+        let old = (1u32, vec![
+            ([0, 1, 2], OldChunk::Uniform(3)),
+            ([4, 5, 6], OldChunk::Rle(vec![(half, 0), (half, 200)])),
+        ]);
+        let chunks = decode_region(&postcard::to_allocvec(&old).unwrap()).unwrap();
+        assert_eq!(chunks[0].0, [0, 1, 2]);
+        assert_eq!(chunks[0].1.uniform(), Some(Block(3)));
+        assert_eq!(chunks[1].1.get(0, 0, 0), Block::AIR);
+        assert_eq!(chunks[1].1.get(31, 31, 31), Block(200));
+    }
+
+    #[test]
+    fn regions_round_trip() {
+        let chunk = Chunk::Uniform(Block::AIR).with_block(1, 2, 3, Block(40_000));
+        let file = RegionFile { format: REGION_FORMAT, chunks: vec![([7, 8, 9], Arc::new(chunk))] };
+        let chunks = decode_region(&postcard::to_allocvec(&file).unwrap()).unwrap();
+        assert_eq!(chunks[0].1.get(1, 2, 3), Block(40_000));
+        assert!(decode_region(&postcard::to_allocvec(&(9u32, 0u8)).unwrap()).is_err());
     }
 }

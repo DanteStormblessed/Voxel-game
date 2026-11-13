@@ -1,10 +1,11 @@
 [package]
-name = "voxel-common"
+name = "kuravoxel-common"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+glam.workspace = true
 serde.workspace = true
 postcard.workspace = true
 tokio.workspace = true
@@ -13,3 +14,5 @@ rustls.workspace = true
 rcgen.workspace = true
 bytes.workspace = true
 toml.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.18"

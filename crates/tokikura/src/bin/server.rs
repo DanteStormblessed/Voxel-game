@@ -1,9 +1,9 @@
-//! Servidor dedicado.
+//! Servidor dedicado de Tokikura.
 
 use std::net::SocketAddr;
 
-use voxel_common::protocol::DEFAULT_PORT;
-use voxel_server::{quic, ServerConfig};
+use kuravoxel_common::protocol::DEFAULT_PORT;
+use kuravoxel_server::{quic, ServerConfig};
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -19,14 +19,14 @@ fn main() -> anyhow::Result<()> {
             "--content" => config.content_dir = value()?.into(),
             "--world" => config.world_dir = std::path::PathBuf::from("worlds").join(value()?),
             "--help" | "-h" => {
-                println!("usage: voxel-server [--bind ADDRESS:PORT] [--seed N] [--world NAME] [--content DIR]");
+                println!("usage: kuravoxel-server [--bind ADDRESS:PORT] [--seed N] [--world NAME] [--content DIR]");
                 return Ok(());
             }
             other => anyhow::bail!("unknown argument: {other}"),
         }
     }
 
-    let handle = voxel_server::start(config)?;
+    let handle = kuravoxel_server::start(config)?;
     quic::listen(handle.clone(), bind)?;
 
     // El servidor vive en sus propios hilos; este espera a Ctrl+C para guardar y salir.

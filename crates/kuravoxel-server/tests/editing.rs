@@ -7,10 +7,10 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use voxel_common::chunk::Chunk;
-use voxel_common::content::ContentData;
-use voxel_common::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
-use voxel_server::{ServerConfig, ServerHandle};
+use kuravoxel_common::chunk::Chunk;
+use kuravoxel_common::content::ContentData;
+use kuravoxel_common::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use kuravoxel_server::{ServerConfig, ServerHandle};
 
 struct Client {
     server: ServerHandle,
@@ -18,12 +18,12 @@ struct Client {
     incoming: Receiver<ServerMsg>,
     content: Arc<ContentData>,
     chunks: HashMap<[i32; 3], Arc<Chunk>>,
-    changes: Vec<([i32; 3], u8)>,
+    changes: Vec<([i32; 3], u16)>,
 }
 
 impl Client {
     fn join(config: ServerConfig) -> Self {
-        let server = voxel_server::start(config).expect("server starts");
+        let server = kuravoxel_server::start(config).expect("server starts");
         let (tx, incoming) = channel();
         let id = server.connect(Box::new(move |msg| tx.send(msg).is_ok()));
         let client = Self {
@@ -63,7 +63,7 @@ impl Client {
         }
     }
 
-    fn block(&self, x: i32, y: i32, z: i32) -> Option<u8> {
+    fn block(&self, x: i32, y: i32, z: i32) -> Option<u16> {
         let chunk = self.chunks.get(&[x >> 5, y >> 5, z >> 5])?;
         Some(chunk.get((x & 31) as usize, (y & 31) as usize, (z & 31) as usize).0)
     }
@@ -77,8 +77,8 @@ impl Client {
 #[test]
 fn edits_are_validated_broadcast_and_saved() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    // VOXEL_TEST_WORLD permite conservar el mundo resultante para inspeccionarlo.
-    let world_dir = std::env::var_os("VOXEL_TEST_WORLD")
+    // KURAVOXEL_TEST_WORLD permite conservar el mundo resultante para inspeccionarlo.
+    let world_dir = std::env::var_os("KURAVOXEL_TEST_WORLD")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("voxel-test-{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&world_dir);
@@ -119,6 +119,35 @@ fn edits_are_validated_broadcast_and_saved() {
     client.pump_until("break confirmed", |c| !c.changes.is_empty());
     assert_eq!(client.changes, vec![(tower[3], 0)]);
 
+    // Una puerta (dos celdas de alto) se coloca entera desde su celda de abajo...
+    let door = client.content.block_id("base:door").expect("door exists").0;
+    let door_top = client.content.block_id("base:door[part=0-1-0]").expect("door top").0;
+    let site = [2, ground + 1, -3];
+    let above = [2, ground + 2, -3];
+    client.changes.clear();
+    client.send(ClientMsg::SetBlock { pos: site, block: door });
+    client.pump_until("door placed", |c| c.changes.len() >= 2);
+    assert_eq!(client.changes, vec![(site, door), (above, door_top)]);
+    // ...no se puede colocar empezando por la de arriba...
+    client.changes.clear();
+    client.send(ClientMsg::SetBlock { pos: [3, ground + 1, -3], block: door_top });
+    // (devuelve lo que hay en las dos celdas que el cliente pudo predecir).
+    client.pump_until("top part refused", |c| c.changes.len() >= 2);
+    assert!(client.changes.contains(&([3, ground + 1, -3], 0)), "{:?}", client.changes);
+    assert!(client.changes.iter().all(|&(_, block)| block != door && block != door_top));
+    // ...ni donde no cabe (la torre ocupa la celda de arriba)...
+    client.changes.clear();
+    client.send(ClientMsg::SetBlock { pos: [0, ground, -3], block: door });
+    client.pump_until("blocked door refused", |c| c.changes.len() >= 2);
+    assert_eq!(client.changes, vec![([0, ground, -3], client.block(0, ground, -3).unwrap()), ([0, ground + 1, -3], brick)]);
+    // ...y romper cualquiera de sus mitades la quita entera.
+    client.changes.clear();
+    client.send(ClientMsg::SetBlock { pos: above, block: 0 });
+    client.pump_until("door broken", |c| c.changes.len() >= 2);
+    let mut broken = client.changes.clone();
+    broken.sort();
+    assert_eq!(broken, vec![(site, 0), (above, 0)]);
+
     client.server.shutdown();
     assert!(world_dir.join("world.toml").exists());
 
@@ -134,7 +163,7 @@ fn edits_are_validated_broadcast_and_saved() {
     assert_eq!(client.ground(0, -3), Some(ground + 3));
     client.server.shutdown();
 
-    if std::env::var_os("VOXEL_TEST_WORLD").is_none() {
+    if std::env::var_os("KURAVOXEL_TEST_WORLD").is_none() {
         let _ = std::fs::remove_dir_all(&world_dir);
     }
 }

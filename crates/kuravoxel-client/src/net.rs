@@ -7,9 +7,9 @@ use std::net::SocketAddr;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use voxel_common::net;
-use voxel_common::protocol::{ClientMsg, ServerMsg};
-use voxel_server::ServerHandle;
+use kuravoxel_common::net;
+use kuravoxel_common::protocol::{ClientMsg, ServerMsg};
+use kuravoxel_server::ServerHandle;
 
 pub struct Connection {
     send: Box<dyn Fn(ClientMsg)>,
@@ -25,7 +25,8 @@ impl Connection {
     /// no se serializan y los chunks se comparten sin copiar.
     pub fn local(server: &ServerHandle) -> Self {
         let (tx, incoming) = channel();
-        let id = server.connect(Box::new(move |msg| tx.send(msg).is_ok()));
+        // Quien aloja el servidor es su operador: puede usar los comandos de consola.
+        let id = server.connect_operator(Box::new(move |msg| tx.send(msg).is_ok()));
         let server = server.clone();
         Self {
             send: Box::new(move |msg| server.message(id, msg)),

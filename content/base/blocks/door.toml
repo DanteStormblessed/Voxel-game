@@ -1,0 +1,9 @@
+# Puerta: el modelo mide 8×16×2 (dos celdas de alto), así que el bloque ocupa dos y se
+# coloca y se rompe entero. Aún no se abre: eso llegará con la interacción.
+name = "Puerta"
+color = "#B5793E"
+category = "Construcción"
+tags = ["madera", "puerta"]
+model = "base:door"
+# El pomo (el frente del modelo) mira hacia quien la coloca.
+orientation = "horizontal"

@@ -1,0 +1,4 @@
+# Plantilla de las hojas: no es un bloque, solo sirve de `parent`.
+template = true
+category = "Naturaleza"
+tags = ["natural", "hojas"]

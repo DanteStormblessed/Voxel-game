@@ -1,0 +1,7 @@
+name = "Escalera de piedra"
+color = "#A9B0BA"
+category = "Construcción"
+tags = ["roca", "escalera"]
+model = "base:stone_stairs"
+# El peldaño bajo mira hacia quien la coloca.
+orientation = "horizontal"

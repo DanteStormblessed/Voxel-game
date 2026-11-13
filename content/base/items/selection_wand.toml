@@ -1,0 +1,7 @@
+# Ítem sin bloque: una herramienta del motor. Reservado para las herramientas
+# creativas (fase 3d); por ahora no hace nada al usarlo.
+name = "Vara de selección"
+color = "#E04CE0"
+category = "Herramientas"
+tool = "selection"
+max_stack = 1

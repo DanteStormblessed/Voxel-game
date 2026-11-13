@@ -1,2 +1,3 @@
+parent = "base:_leaves"
 name = "Hojas lima"
 color = "#B5E81F"

@@ -1,0 +1,6 @@
+name = "Losa de piedra"
+color = "#A9B0BA"
+category = "Construcción"
+tags = ["roca", "losa"]
+model = "base:stone_slab"
+# Choca con la forma del modelo (medio bloque): se sube sin saltar.

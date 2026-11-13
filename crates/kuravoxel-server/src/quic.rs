@@ -3,8 +3,8 @@
 use std::net::SocketAddr;
 
 use tokio::sync::mpsc::unbounded_channel;
-use voxel_common::net;
-use voxel_common::protocol::{ClientMsg, ServerMsg};
+use kuravoxel_common::net;
+use kuravoxel_common::protocol::{ClientMsg, ServerMsg};
 
 use crate::ServerHandle;
 

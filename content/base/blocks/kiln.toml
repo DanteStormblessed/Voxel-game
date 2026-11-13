@@ -1,0 +1,9 @@
+name = "Horno"
+color = "#6F6A66"
+category = "Construcción"
+# Mira hacia quien lo coloca (facing=north|east|south|west).
+orientation = "horizontal"
+
+[faces]
+front = "#E2723B"
+top = "#58534F"

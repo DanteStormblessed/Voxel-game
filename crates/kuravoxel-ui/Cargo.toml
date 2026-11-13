@@ -1,0 +1,15 @@
+[package]
+name = "kuravoxel-ui"
+version.workspace = true
+edition.workspace = true
+description = "Iced user interfaces drawn on top of a KuraVoxel scene"
+
+[dependencies]
+kuravoxel-client.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+iced_wgpu.workspace = true
+iced_winit.workspace = true
+iced_widget.workspace = true
+iced_runtime.workspace = true
+log.workspace = true

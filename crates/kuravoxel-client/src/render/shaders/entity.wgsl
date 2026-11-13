@@ -11,6 +11,8 @@ struct Globals {
     fog_color: vec4<f32>,
     fog_params: vec4<f32>,
     params: vec4<f32>,
+    focus: vec4<f32>,
+    voxel_band: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -62,7 +64,10 @@ fn vs_main(
     let cv = f32((corner >> 1u) & 1u) - 0.5;
 
     let local = (normal * 0.5 + tan_u * cu + tan_v * cv) * size.xyz;
-    let rel = center_yaw.xyz + rotate_y(local, center_yaw.w);
+    var rel = center_yaw.xyz + rotate_y(local, center_yaw.w);
+    // Misma curvatura del mundo que el terreno (ver terrain.wgsl).
+    let d = rel.xz - globals.cam_local.xz;
+    rel.y -= dot(d, d) * globals.fog_params.y;
 
     var out: VsOut;
     out.clip = globals.view_proj * vec4<f32>(rel, 1.0);
@@ -79,8 +84,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ambient = mix(globals.ground_ambient.rgb, globals.sky_ambient.rgb, normal.y * 0.5 + 0.5);
     var color = in.color * (ambient + globals.sun_color.rgb * sun);
 
-    let dist = distance(in.rel_pos.xz, globals.cam_local.xz);
-    let fog = clamp((dist - globals.fog_params.x) * globals.fog_params.y, 0.0, 1.0);
-    color = mix(color, globals.fog_color.rgb, fog * fog);
+    // Misma bruma que el terreno (ver terrain.wgsl).
+    let t = distance(in.rel_pos.xz, globals.focus.xz) / globals.fog_params.x;
+    let haze = mix(globals.focus.w * (1.0 - exp(-2.5 * t)), 1.0, smoothstep(globals.fog_params.w, 1.0, t));
+    color = mix(color, globals.fog_color.rgb, haze);
     return vec4<f32>(color, 1.0);
 }

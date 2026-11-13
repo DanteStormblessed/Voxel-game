@@ -8,7 +8,7 @@ use wgpu::util::DeviceExt;
 
 use crate::camera::Frustum;
 use crate::mesher::ChunkMesh;
-use voxel_common::chunk::CHUNK_SIZE_I;
+use kuravoxel_common::chunk::CHUNK_SIZE_I;
 use crate::world::MeshKey;
 
 const QUAD_BYTES: u64 = 8;
@@ -23,6 +23,8 @@ struct GpuChunk {
     scale: i32,
     buffer: wgpu::Buffer,
     face_ranges: [(u32, u32); 6],
+    /// Quads translúcidos (al final del buffer).
+    transparent: (u32, u32),
     /// Posición de su origen dentro del buffer de uniforms compartido.
     slot: u32,
     quads: u32,
@@ -37,6 +39,8 @@ struct Visible {
 
 pub struct TerrainRenderer {
     pipeline: wgpu::RenderPipeline,
+    /// Segundo pase: agua y cristal, con mezcla y sin escribir profundidad.
+    translucent_pipeline: wgpu::RenderPipeline,
 
     // Origen de cada chunk: un único buffer de uniforms direccionado con offset dinámico.
     // Funciona igual en Vulkan y en GLES 3 (sin push constants ni storage buffers).
@@ -87,51 +91,57 @@ impl TerrainRenderer {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: QUAD_BYTES,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Uint32x2,
-                        offset: 0,
-                        shader_location: 0,
+        let pipeline_for = |label: &str, translucent: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: QUAD_BYTES,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        }],
                     }],
-                }],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: depth_format,
-                depth_write_enabled: true,
-                // Z invertida: lo más cercano tiene el valor más alto.
-                depth_compare: wgpu::CompareFunction::Greater,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-            cache: None,
-        });
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    front_face: wgpu::FrontFace::Ccw,
+                    // El agua y el cristal se ven también desde dentro.
+                    cull_mode: if translucent { None } else { Some(wgpu::Face::Back) },
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    // Lo translúcido no tapa: lo que hay detrás ya está dibujado.
+                    depth_write_enabled: !translucent,
+                    // Z invertida: lo más cercano tiene el valor más alto.
+                    depth_compare: wgpu::CompareFunction::Greater,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: translucent.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = pipeline_for("terrain pipeline", false);
+        let translucent_pipeline = pipeline_for("translucent terrain pipeline", true);
 
         let slot_stride =
             (device.limits().min_uniform_buffer_offset_alignment as u64).max(CHUNK_UNIFORM_BYTES);
@@ -140,6 +150,7 @@ impl TerrainRenderer {
 
         Self {
             pipeline,
+            translucent_pipeline,
             chunk_layout,
             chunk_uniforms,
             chunk_bind_group,
@@ -197,9 +208,20 @@ impl TerrainRenderer {
             scale,
             buffer,
             face_ranges: mesh.face_ranges,
+            transparent: mesh.transparent,
             slot,
             quads,
         });
+    }
+
+    /// Suelta todas las mallas.
+    pub fn clear(&mut self) {
+        for chunk in self.chunks.drain(..) {
+            self.free_slots.push(chunk.slot);
+        }
+        self.index.clear();
+        self.visible.clear();
+        self.total_quads = 0;
     }
 
     pub fn remove(&mut self, key: MeshKey) {
@@ -265,28 +287,37 @@ impl TerrainRenderer {
     /// espacio en el que está construido el frustum.
     ///
     /// `clip` es la distancia horizontal a la que los voxeles reales ceden el paso al
-    /// terreno lejano; `band` es el solape entre ambos.
+    /// terreno lejano y `voxel_band` las alturas (relativas al chunk de la cámara) entre
+    /// las que hay voxeles; `band` es el solape entre ambos. `curvature` es el radio con el
+    /// que el shader curva el terreno hacia abajo: las cajas se alargan para cubrirlo.
     pub fn cull(
         &mut self,
         frustum: &Frustum,
         cam_chunk: IVec3,
         cam_local: Vec3,
         clip: f32,
+        voxel_band: [f32; 2],
         band: f32,
+        curvature: f32,
     ) {
         self.visible.clear();
         for (index, chunk) in self.chunks.iter().enumerate() {
             let extent = Vec3::splat((CHUNK_SIZE_I * chunk.scale) as f32);
-            let min = ((chunk.origin - cam_chunk) * CHUNK_SIZE_I).as_vec3();
+            let mut min = ((chunk.origin - cam_chunk) * CHUNK_SIZE_I).as_vec3();
             let max = min + extent;
 
             // Lo que el shader descartaría entero por distancia ni se dibuja.
             let near = (cam_local.clamp(min, max) - cam_local).truncate_y();
             let far = (min - cam_local).abs().max((max - cam_local).abs()).truncate_y();
+            min.y -= far.length_squared() / (2.0 * curvature);
             let skip = if chunk.scale == 1 {
                 near.length_squared() > clip * clip
             } else {
+                // Terreno lejano tapado del todo por los voxeles: dentro del círculo y
+                // dentro de las capas de chunks que hay cargadas.
                 far.length() < clip - band
+                    && min.y >= voxel_band[0] + band
+                    && max.y <= voxel_band[1] - band
             };
             if skip || !frustum.intersects_aabb(min, max) {
                 continue;
@@ -350,6 +381,29 @@ impl TerrainRenderer {
                     }
                 }
             }
+        }
+        draw_calls
+    }
+
+    /// Segundo pase: lo translúcido de los chunks elegidos por `cull`, de lejos a cerca
+    /// para que la mezcla salga bien entre chunks. Devuelve el número de draw calls.
+    pub fn draw_translucent(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup) -> u32 {
+        let mut draw_calls = 0;
+        for visible in self.visible.iter().rev() {
+            let chunk = &self.chunks[visible.index as usize];
+            let (start, end) = chunk.transparent;
+            if end <= start {
+                continue;
+            }
+            if draw_calls == 0 {
+                pass.set_pipeline(&self.translucent_pipeline);
+                pass.set_bind_group(0, globals, &[]);
+            }
+            let offset = (chunk.slot as u64 * self.slot_stride) as u32;
+            pass.set_bind_group(1, &self.chunk_bind_group, &[offset]);
+            pass.set_vertex_buffer(0, chunk.buffer.slice(start as u64 * QUAD_BYTES..end as u64 * QUAD_BYTES));
+            pass.draw(0..4, 0..end - start);
+            draw_calls += 1;
         }
         draw_calls
     }

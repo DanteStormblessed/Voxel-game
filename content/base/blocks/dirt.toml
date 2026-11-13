@@ -1,2 +1,4 @@
 name = "Tierra"
 color = "#9A6A3E"
+category = "Terreno"
+tags = ["natural", "suelo"]

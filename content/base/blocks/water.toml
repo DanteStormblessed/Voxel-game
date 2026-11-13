@@ -1,2 +1,8 @@
 name = "Agua"
 color = "#2FD2F2"
+category = "Terreno"
+tags = ["líquido"]
+# Se atraviesa y deja ver a través.
+solid = false
+transparent = true
+opacity = 0.85

@@ -1,15 +1,31 @@
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/server", "crates/client"]
-default-members = ["crates/client"]
+members = [
+    "crates/kuravoxel-common",
+    "crates/kuravoxel-server",
+    "crates/kuravoxel-client",
+    "crates/kuravoxel-ui",
+    "crates/tokikura",
+]
+default-members = ["crates/tokikura"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
-voxel-common = { path = "crates/common" }
-voxel-server = { path = "crates/server" }
+kuravoxel-common = { path = "crates/kuravoxel-common" }
+kuravoxel-server = { path = "crates/kuravoxel-server" }
+kuravoxel-client = { path = "crates/kuravoxel-client" }
+kuravoxel-ui = { path = "crates/kuravoxel-ui" }
+# wgpu y winit van a la par de los que usa Iced (iced_wgpu / iced_winit 0.14): el motor y
+# la interfaz comparten dispositivo gráfico y eventos de ventana.
+wgpu = "27"
+winit = "0.30"
+iced_wgpu = "0.14"
+iced_winit = "0.14"
+iced_widget = { version = "0.14", features = ["wgpu", "image"] }
+iced_runtime = "0.14"
 glam = "0.30"
 rayon = "1"
 rustc-hash = "2"

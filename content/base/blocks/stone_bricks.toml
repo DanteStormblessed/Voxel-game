@@ -1,0 +1,5 @@
+# Hereda de la piedra (etiquetas incluidas) y cambia nombre, color y categoría.
+parent = "base:stone"
+name = "Ladrillos de piedra"
+color = "#7E8591"
+category = "Construcción"
