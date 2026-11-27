@@ -85,6 +85,26 @@ impl<'de> Deserialize<'de> for Model {
 }
 
 impl Model {
+    /// El modelo girado `turns` cuartos de vuelta alrededor de la vertical, en el sentido
+    /// que lleva el norte (−Z) al este (+X): el mismo de `Rotation::FrontToEast`.
+    pub fn rotated_y(&self, turns: u8) -> Model {
+        let mut model = self.clone();
+        for _ in 0..turns % 4 {
+            let [sx, sy, sz] = model.size;
+            let mut voxels = vec![0u8; model.voxels.len()];
+            for z in 0..sz {
+                for y in 0..sy {
+                    for x in 0..sx {
+                        // (x, z) → (sz − 1 − z, x); el tamaño pasa a ser (sz, sy, sx).
+                        voxels[(sz - 1 - z) + y * sz + x * sz * sy] = model.get(x, y, z);
+                    }
+                }
+            }
+            model = Model { size: [sz, sy, sx], voxels, palette: model.palette };
+        }
+        model
+    }
+
     pub fn get(&self, x: usize, y: usize, z: usize) -> u8 {
         let [sx, sy, _] = self.size;
         self.voxels[x + y * sx + z * sx * sy]

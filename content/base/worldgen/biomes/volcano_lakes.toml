@@ -1,0 +1,92 @@
+# Volcán y lagos: un gran cono nevado sobre un llano de bosques y lagos.
+name = "Volcán y Lagos"
+color = "#12B04A"
+
+[nodes]
+# El volcán está en un punto fijo del mundo. `cone` vale 1 en su centro y 0 a 1500 m.
+cone = { type = "point", x = 100, z = 3650, radius = 1500 }
+# Perfil del cono: faldas, cumbre a ~520 m y cráter.
+volcano = { type = "curve", input = "cone", smooth = true, points = [
+    [0.0, 0], [0.35, 30], [0.6, 120], [0.8, 290], [0.93, 500], [0.955, 520], [0.975, 500], [1.0, 455],
+] }
+
+base_noise = { type = "noise", scale = 700, octaves = 3 }
+base_part = { type = "mul", inputs = ["base_noise", 7] }
+rough = { type = "mul", inputs = ["hills", 3] }
+# Borde irregular de la ceniza del volcán.
+cone_edge = { type = "mul", inputs = ["hills", 0.07] }
+ash_zone = { type = "add", inputs = ["cone", "cone_edge"] }
+base = { type = "add", inputs = [16, "base_part", "rough"] }
+
+coast_bumps = { type = "mul", inputs = ["hills", 16] }
+coast_height = { type = "add", inputs = [40, "coast_bumps"] }
+coast_range = { type = "mul", inputs = ["coastal", "coast_height"] }
+ground = { type = "add", inputs = ["base", "coast_range"] }
+
+# Lagos: cuencas redondas que bajan por debajo del nivel del agua.
+lake_spots = { type = "spots", spacing = 1100, radius = 430, chance = 0.8, vary = 0.5 }
+# Un ruido recorta la orilla para que no sea un círculo.
+lake_noise = { type = "noise", scale = 240, octaves = 3 }
+lake_edge = { type = "mul", inputs = ["lake_noise", 0.3] }
+lake_shape = { type = "add", inputs = ["lake_spots", "lake_edge"] }
+lake = { type = "smoothstep", input = "lake_shape", from = 0.12, to = 0.45 }
+lake_reach = { type = "mul", inputs = ["inland", "lake"] }
+basin = { type = "mix", a = "ground", b = -9, t = "lake_reach" }
+
+shore = { type = "smoothstep", input = "across", from = 0.1, to = 0.18 }
+lowland = { type = "mix", a = "seafloor", b = "basin", t = "shore" }
+height = { type = "add", inputs = ["lowland", "volcano", "cordillera"] }
+
+[[surface]]
+above = 310
+flatter = 2.25
+jitter = 8
+top = "base:snow"
+under = "base:stone"
+
+# Faldas del volcán: ceniza sobre basalto.
+[[surface]]
+node = "ash_zone"
+node_above = 0.5
+steeper = 1.65
+top = "base:basalt"
+
+[[surface]]
+node = "ash_zone"
+node_above = 0.5
+top = "base:ash"
+under = "base:basalt"
+depth = 2
+
+# Playas de arena negra.
+[[surface]]
+below = 2
+top = "base:ash"
+
+[[surface]]
+steeper = 1.8
+top = "base:stone"
+
+[[surface]]
+above = 200
+jitter = 10
+top = "base:stone"
+
+[[surface]]
+top = "base:grass"
+under = "base:dirt"
+
+[[trees]]
+density = 0.42
+wood = "base:wood"
+leaves = ["base:leaves_green", "base:leaves_dark", "base:leaves_lime"]
+trunk = [4, 7]
+on = ["base:grass"]
+
+[[trees]]
+density = 0.12
+shape = "pine"
+wood = "base:wood"
+leaves = ["base:leaves_dark"]
+trunk = [7, 11]
+on = ["base:grass"]

@@ -30,7 +30,7 @@ pub struct WorldInfo {
     pub seed: Option<u32>,
 }
 
-fn read_seed(world_toml: &Path) -> Option<u32> {
+pub fn read_seed(world_toml: &Path) -> Option<u32> {
     let table: toml::Table = std::fs::read_to_string(world_toml).ok()?.parse().ok()?;
     u32::try_from(table.get("seed")?.as_integer()?).ok()
 }

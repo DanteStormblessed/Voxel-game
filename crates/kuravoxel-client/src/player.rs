@@ -37,6 +37,12 @@ const CAMERA_MARGIN: f64 = 0.35;
 /// En tercera persona la cámara mira un poco por encima de la cabeza, para que el
 /// personaje no tape lo que se apunta.
 const PIVOT_LIFT: f64 = 0.3;
+/// Cerca, la cámara va sobre el hombro derecho (como en Hytale): el punto de órbita se
+/// desplaza estos metros a la derecha y el personaje queda a la izquierda del punto de
+/// mira. Entre las dos distancias de `SHOULDER_FADE` vuelve al centro, que es donde la
+/// cámara pasa a orbitar libre.
+const SHOULDER_OFFSET: f32 = 0.7;
+const SHOULDER_FADE: (f32, f32) = (6.0, 10.0);
 /// A partir de esta distancia de cámara se dibuja al propio jugador.
 const SELF_VISIBLE_DISTANCE: f32 = 0.9;
 
@@ -67,6 +73,8 @@ pub struct Player {
     zoom_target: f32,
     zoom: f32,
     distance: f32,
+    /// Desplazamiento lateral de la cámara ahora mismo (menor si hay una pared al lado).
+    shoulder: f32,
 }
 
 impl Player {
@@ -82,6 +90,7 @@ impl Player {
             zoom_target: 0.0,
             zoom: 0.0,
             distance: 0.0,
+            shoulder: 0.0,
         }
     }
 
@@ -150,10 +159,27 @@ impl Player {
         Vec3::new(sin_yaw * cos_pitch, sin_pitch, -cos_yaw * cos_pitch)
     }
 
+    /// Hacia la derecha de la cámara, en horizontal.
+    fn right(&self) -> Vec3 {
+        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
+        Vec3::new(cos_yaw, 0.0, sin_yaw)
+    }
+
+    /// Desplazamiento lateral actual de la cámara (hombro derecho), en metros.
+    pub fn shoulder_offset(&self) -> f32 {
+        self.shoulder
+    }
+
     /// Punto alrededor del que orbita la cámara y desde el que sale el rayo de edición.
-    /// Como la cámara mira justo a este punto, el punto de mira apunta a lo mismo en
-    /// primera y en tercera persona.
+    /// Como la cámara mira en la dirección de la mirada desde este punto, el punto de
+    /// mira señala justo lo que alcanza el rayo. En tercera persona cercana está sobre
+    /// el hombro derecho.
     pub fn pivot(&self, world: &World) -> DVec3 {
+        self.head(world) + self.right().as_dvec3() * self.shoulder as f64
+    }
+
+    /// Punto sobre la cabeza del que cuelga la cámara, sin el desplazamiento al hombro.
+    fn head(&self, world: &World) -> DVec3 {
         let eye = self.body.visual_eye();
         if self.distance <= 0.0 {
             return eye;
@@ -234,7 +260,27 @@ impl Player {
         // acerca de golpe, y cuando deja de estorbar se aleja con suavidad. La vista de
         // mapa y el espectador van por libre.
         let mut allowed = self.zoom;
-        if self.zoom > 0.0 && view != ViewKind::Map && self.mode != MoveMode::Ghost {
+        let collides = self.zoom > 0.0 && view != ViewKind::Map && self.mode != MoveMode::Ghost;
+
+        // Cámara al hombro: entra con la distancia y se va al alejarse. Una pared a la
+        // derecha la devuelve al centro de golpe; al quedar libre, sale con suavidad.
+        let (fade_from, fade_to) = SHOULDER_FADE;
+        let fade = ((fade_to - self.zoom) / (fade_to - fade_from)).clamp(0.0, 1.0);
+        let mut side = SHOULDER_OFFSET * (self.zoom / THIRD_PERSON_MIN).clamp(0.0, 1.0) * fade * fade * (3.0 - 2.0 * fade);
+        if collides && side > 0.0 {
+            let head = self.head(world);
+            if let Some(hit) = world.raycast_distance(head, self.right(), side as f64 + CAMERA_MARGIN) {
+                side = side.min((hit - CAMERA_MARGIN).max(0.0) as f32);
+            }
+        }
+        self.shoulder = if side <= self.shoulder {
+            side
+        } else {
+            let eased = self.shoulder + (side - self.shoulder) * (1.0 - (-ZOOM_SMOOTHING * dt).exp());
+            if side - eased < 0.005 { side } else { eased }
+        };
+
+        if collides {
             self.distance = self.distance.min(self.zoom);
             let pivot = self.pivot(world);
             if let Some(hit) = world.raycast_distance(pivot, -self.forward(), self.zoom as f64 + CAMERA_MARGIN) {
@@ -374,6 +420,47 @@ mod tests {
         player.place_camera(&mut camera, &world);
         assert!(player.shown_distance() < 3.0, "distance {}", player.shown_distance());
         assert!(camera.pos.y > 0.0, "camera at {}", camera.pos.y);
+    }
+
+    #[test]
+    fn up_close_the_camera_sits_over_the_right_shoulder() {
+        let mut world = flat_world();
+        let mut player = Player::new();
+        player.set_eye(DVec3::new(0.5, physics::EYE_HEIGHT, 0.5));
+        player.pitch = 0.0;
+        let mut input = Input::default();
+        let mut camera = Camera::new(DVec3::ZERO);
+
+        // Con yaw 0 se mira a -Z y la derecha es +X.
+        player.set_camera_distance(4.0);
+        simulate(&mut player, &mut input, &world, 2.0);
+        player.place_camera(&mut camera, &world);
+        assert!((player.shoulder_offset() - SHOULDER_OFFSET).abs() < 1e-3);
+        assert!((camera.pos.x - (0.5 + SHOULDER_OFFSET as f64)).abs() < 1e-3, "camera at {}", camera.pos);
+        // El rayo de edición sale del mismo punto desplazado: la mira no engaña.
+        let pivot = player.pivot(&world);
+        assert!((pivot - camera.pos).cross(player.forward().as_dvec3()).length() < 1e-6);
+
+        // Una pared justo a la derecha devuelve la cámara al centro.
+        let mut wall = Chunk::Uniform(Block::AIR);
+        for y in 0..4 {
+            for z in 0..3 {
+                wall = wall.with_block(1, y, z, Block(1));
+            }
+        }
+        world.insert_chunk(IVec3::ZERO, Arc::new(wall));
+        simulate(&mut player, &mut input, &world, 0.1);
+        player.place_camera(&mut camera, &world);
+        assert!(player.shoulder_offset() < 0.2, "offset {}", player.shoulder_offset());
+        assert!(camera.pos.x < 1.0 - 0.3, "camera at {}", camera.pos);
+
+        // Lejos, la cámara orbita centrada; en primera persona, en los ojos.
+        player.set_camera_distance(16.0);
+        simulate(&mut player, &mut input, &world, 2.0);
+        assert_eq!(player.shoulder_offset(), 0.0);
+        player.set_camera_distance(0.0);
+        simulate(&mut player, &mut input, &world, 2.0);
+        assert_eq!(player.shoulder_offset(), 0.0);
     }
 
     #[test]

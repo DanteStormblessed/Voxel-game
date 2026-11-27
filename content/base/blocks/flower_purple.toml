@@ -1,0 +1,6 @@
+name = "Flor violeta"
+color = "#A070E0"
+category = "Naturaleza"
+tags = ["natural", "flor"]
+model = "base:flower_purple"
+solid = false

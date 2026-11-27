@@ -1,4 +1,5 @@
-// Terreno: un quad por instancia (8 bytes), 4 vértices generados aquí.
+// Terreno: un quad por instancia (8 bytes), 4 vértices generados aquí. Los uniforms del
+// frame, la luz y la bruma vienen de common.wgsl; las tablas de caras, de faces.wgsl.
 //
 // Formato de la instancia (ver ChunkMesh en mesher.rs). El bit 31 de quad.y distingue
 // un cubo (caras de voxel) de un quad de mini-voxeles (modelos, 1/8 de voxel):
@@ -7,37 +8,12 @@
 //   mini  quad.x  celda xyz:5·3 | desplazamiento xyz:3·3 | ancho-1:3 | alto-1:3
 //         quad.y  color:20 | cara:3 | libre:1 | luz:4 | libre:3 | 1
 
-struct Globals {
-    view_proj: mat4x4<f32>,
-    // Chunk en el que está la cámara. Todo se calcula relativo a su origen.
-    cam_chunk: vec4<i32>,
-    cam_local: vec4<f32>,
-    sun_dir: vec4<f32>,
-    sun_color: vec4<f32>,
-    sky_ambient: vec4<f32>,
-    ground_ambient: vec4<f32>,
-    fog_color: vec4<f32>,
-    // x: distancia a la que la bruma tapa del todo el terreno, y: 1 / (2 · radio de
-    // curvatura), z: solape voxeles / terreno lejano, w: fracción de x en la que empieza
-    // el fundido final con el cielo
-    fog_params: vec4<f32>,
-    // x: radio del bisel en voxeles, y: brillo mínimo con oclusión total,
-    // z: crecimiento del quad por unidad de distancia,
-    // w: distancia a la que los voxeles reales ceden el paso al terreno lejano
-    params: vec4<f32>,
-    // xyz: punto en el que se centra la vista (el jugador); w: intensidad de la bruma
-    focus: vec4<f32>,
-    // x, y: alturas (relativas al chunk de la cámara) entre las que hay voxeles reales
-    voxel_band: vec4<f32>,
-};
-
 struct ChunkData {
     // xyz: coordenadas del chunk (en chunks de 32 voxeles, no en voxeles).
     // w: tamaño de celda en voxeles (1 = chunk real; 2, 4... = terreno lejano).
     origin: vec4<i32>,
 };
 
-@group(0) @binding(0) var<uniform> globals: Globals;
 // Paleta: 8 entradas por número de bloque (una por cara) y después los colores de los
 // modelos. La entrada n está en (n % PALETTE_WIDTH, n / PALETTE_WIDTH). Textura sRGB: el
 // color llega en lineal; el alfa es la opacidad de los bloques translúcidos.
@@ -48,45 +24,6 @@ const EMISSIVE_BOOST: f32 = 1.6;
 @group(1) @binding(0) var<uniform> chunk: ChunkData;
 
 const CHUNK_SIZE: i32 = 32;
-
-// Tablas por cara: +X, -X, +Y, -Y, +Z, -Z. Siempre U × V = normal.
-fn face_u(face: u32) -> vec3<f32> {
-    var table = array<vec3<f32>, 6>(
-        vec3<f32>(0.0, 1.0, 0.0),
-        vec3<f32>(0.0, 0.0, 1.0),
-        vec3<f32>(0.0, 0.0, 1.0),
-        vec3<f32>(1.0, 0.0, 0.0),
-        vec3<f32>(1.0, 0.0, 0.0),
-        vec3<f32>(0.0, 1.0, 0.0),
-    );
-    return table[face];
-}
-
-fn face_v(face: u32) -> vec3<f32> {
-    var table = array<vec3<f32>, 6>(
-        vec3<f32>(0.0, 0.0, 1.0),
-        vec3<f32>(0.0, 1.0, 0.0),
-        vec3<f32>(1.0, 0.0, 0.0),
-        vec3<f32>(0.0, 0.0, 1.0),
-        vec3<f32>(0.0, 1.0, 0.0),
-        vec3<f32>(1.0, 0.0, 0.0),
-    );
-    return table[face];
-}
-
-// Cuánto baja un punto por la curvatura del mundo, según su distancia horizontal a la cámara.
-fn curvature_drop(rel: vec3<f32>) -> f32 {
-    let d = rel.xz - globals.cam_local.xz;
-    return dot(d, d) * globals.fog_params.y;
-}
-
-// Perspectiva aérea: lo lejano se tiñe del color del cielo poco a poco y, al llegar al
-// borde del terreno visible, se funde con él del todo. Se mide desde el jugador.
-fn haze(rel: vec3<f32>) -> f32 {
-    let t = distance(rel.xz, globals.focus.xz) / globals.fog_params.x;
-    let aerial = globals.focus.w * (1.0 - exp(-2.5 * t));
-    return mix(aerial, 1.0, smoothstep(globals.fog_params.w, 1.0, t));
-}
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -186,8 +123,35 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @location(0) quad: vec2<u32>) -> 
     return out;
 }
 
+// Casi todo el terreno se dibuja con `fs_main`, sin `discard`: así la GPU puede descartar
+// por profundidad lo tapado antes de ejecutar el shader. Solo los chunks y teselas que
+// cruzan el relevo entre voxeles y terreno lejano (los elige `TerrainRenderer::cull`) usan
+// `fs_clipped`, que recorta primero y sombrea después.
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return shade(in);
+}
+
+@fragment
+fn fs_clipped(in: VsOut) -> @location(0) vec4<f32> {
+    // --- Relevo entre voxeles reales y terreno lejano ---------------------------------
+    // Los voxeles ocupan un cilindro: hasta `clip` en horizontal y entre las alturas de
+    // `voxel_band`. El terreno lejano se dibuja fuera de él, con un poco de solape, así
+    // que también cubre lo que queda muy por debajo o por encima del jugador.
+    let dist = distance(in.rel_pos.xz, globals.cam_local.xz);
+    let clip = globals.params.w;
+    let overlap = globals.fog_params.z;
+    let y = in.rel_pos.y;
+    let inside = dist < clip - overlap
+        && y > globals.voxel_band.x + overlap
+        && y < globals.voxel_band.y - overlap;
+    if (in.lod > 0.5 && inside) || (in.lod < 0.5 && dist > clip) {
+        discard;
+    }
+    return shade(in);
+}
+
+fn shade(in: VsOut) -> vec4<f32> {
     let flat_normal = cross(in.tan_u, in.tan_v);
 
     // --- Bisel -----------------------------------------------------------------------
@@ -211,30 +175,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ao_raw = mix(mix(in.ao.x, in.ao.y, f.x), mix(in.ao.z, in.ao.w, f.x), f.y);
     let ao = mix(globals.params.y, 1.0, ao_raw);
 
-    // --- Luz: sol direccional + ambiente hemisférico ---------------------------------
-    let sun = max(dot(normal, globals.sun_dir.xyz), 0.0);
-    let ambient = mix(globals.ground_ambient.rgb, globals.sky_ambient.rgb, normal.y * 0.5 + 0.5);
-    var color = in.color.rgb * (ambient + globals.sun_color.rgb * sun) * ao;
+    // --- Luz: sol o luna con su sombra + ambiente hemisférico -------------------------
+    var color = in.color.rgb * surface_light(normal, flat_normal, in.rel_pos) * ao;
     // Los bloques que emiten luz no tienen sombra: se ven de su color, más claro.
     color = mix(color, in.color.rgb * EMISSIVE_BOOST, in.glow);
 
     // --- Bruma de la distancia ---------------------------------------------------------
-    color = mix(color, globals.fog_color.rgb, haze(in.rel_pos));
-    let dist = distance(in.rel_pos.xz, globals.cam_local.xz);
-
-    // --- Relevo entre voxeles reales y terreno lejano ---------------------------------
-    // Los voxeles ocupan un cilindro: hasta `clip` en horizontal y entre las alturas de
-    // `voxel_band`. El terreno lejano se dibuja fuera de él, con un poco de solape, así
-    // que también cubre lo que queda muy por debajo o por encima del jugador.
-    let clip = globals.params.w;
-    let overlap = globals.fog_params.z;
-    let y = in.rel_pos.y;
-    let inside = dist < clip - overlap
-        && y > globals.voxel_band.x + overlap
-        && y < globals.voxel_band.y - overlap;
-    if (in.lod > 0.5 && inside) || (in.lod < 0.5 && dist > clip) {
-        discard;
-    }
-
+    color = apply_haze(color, in.rel_pos);
     return vec4<f32>(color, in.color.a);
 }

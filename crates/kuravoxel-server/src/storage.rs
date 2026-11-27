@@ -19,6 +19,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use kuravoxel_common::block::Block;
 use kuravoxel_common::chunk::{rle_decode, Chunk};
+use kuravoxel_common::protocol::WorldTime;
 
 /// Chunks por lado de una región (como desplazamiento de bits).
 const REGION_BITS: i32 = 3;
@@ -38,6 +39,26 @@ pub struct WorldMeta {
     /// índices no cambian entre sesiones.
     #[serde(default)]
     pub items: Vec<String>,
+    /// Hora del día (0-24) y segundos reales que dura un día (0 = tiempo parado).
+    #[serde(default = "default_time")]
+    pub time: f32,
+    #[serde(default = "default_day_length")]
+    pub day_length: f32,
+    /// Días enteros desde que empezó el mundo (de ahí sale la fase de la luna).
+    #[serde(default)]
+    pub day: u32,
+    /// Perfil que usa este mundo para cada bioma que no usa su archivo por defecto
+    /// (identificador del bioma → nombre del perfil).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub profiles: std::collections::BTreeMap<String, String>,
+}
+
+fn default_time() -> f32 {
+    WorldTime::default().hours
+}
+
+fn default_day_length() -> f32 {
+    WorldTime::default().day_length
 }
 
 #[derive(Serialize)]
@@ -97,6 +118,9 @@ pub struct Storage {
     dir: PathBuf,
     /// Regiones ya leídas del disco (o creadas). Solo contienen chunks modificados.
     regions: FxHashMap<IVec3, Region>,
+    /// Alturas (en chunks) de los chunks modificados de cada columna (x, z), entre las
+    /// regiones ya leídas.
+    columns: FxHashMap<(i32, i32), Vec<i32>>,
 }
 
 fn region_of(chunk: IVec3) -> IVec3 {
@@ -124,7 +148,7 @@ impl Storage {
         } else {
             None
         };
-        Ok((Self { dir: dir.to_path_buf(), regions: FxHashMap::default() }, meta))
+        Ok((Self { dir: dir.to_path_buf(), regions: FxHashMap::default(), columns: FxHashMap::default() }, meta))
     }
 
     pub fn write_meta(&self, meta: &WorldMeta) -> anyhow::Result<()> {
@@ -158,6 +182,9 @@ impl Storage {
                     }
                 }
             }
+            for pos in region.chunks.keys() {
+                self.columns.entry((pos.x, pos.z)).or_default().push(pos.y);
+            }
             self.regions.insert(key, region);
         }
         self.regions.get_mut(&key).expect("region inserted above")
@@ -171,8 +198,41 @@ impl Storage {
     /// Registra la versión modificada de un chunk; se escribirá en el próximo guardado.
     pub fn put(&mut self, pos: IVec3, chunk: Arc<Chunk>) {
         let region = self.region(region_of(pos));
-        region.chunks.insert(pos, chunk);
+        let known = region.chunks.insert(pos, chunk).is_some();
         region.dirty = true;
+        if !known {
+            self.columns.entry((pos.x, pos.z)).or_default().push(pos.y);
+        }
+    }
+
+    /// Lee todas las regiones del disco, para saber de una vez qué se ha modificado en
+    /// todo el mundo. Devuelve las columnas de chunks (x, z) con algo guardado.
+    pub fn load_all(&mut self) -> Vec<(i32, i32)> {
+        let names: Vec<String> = std::fs::read_dir(self.dir.join("regions"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .collect();
+        for name in names {
+            let Some(coords) = name.strip_prefix("r.").and_then(|rest| rest.strip_suffix(".bin")) else {
+                continue;
+            };
+            let parts: Vec<i32> = coords.split('.').filter_map(|part| part.parse().ok()).collect();
+            if let [x, y, z] = parts[..] {
+                self.region(IVec3::new(x, y, z));
+            }
+        }
+        self.columns.keys().copied().collect()
+    }
+
+    /// Chunks modificados de una columna, de arriba abajo, con su altura en chunks.
+    pub fn column_chunks(&mut self, (cx, cz): (i32, i32)) -> Vec<(i32, Arc<Chunk>)> {
+        let mut heights = self.columns.get(&(cx, cz)).cloned().unwrap_or_default();
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        heights
+            .into_iter()
+            .filter_map(|cy| Some((cy, self.chunk(IVec3::new(cx, cy, cz))?)))
+            .collect()
     }
 
     /// Escribe las regiones con cambios. Devuelve cuántas se han escrito.

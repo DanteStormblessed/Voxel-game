@@ -1,0 +1,6 @@
+name = "Flor amarilla"
+color = "#F7D94C"
+category = "Naturaleza"
+tags = ["natural", "flor"]
+model = "base:flower_yellow"
+solid = false

@@ -1,0 +1,73 @@
+# Bosque templado (selva valdiviana): cerros abruptos cubiertos de bosque muy denso,
+# con valles de río profundos.
+name = "Bosque Templado"
+color = "#0B7A3B"
+
+[nodes]
+rugged = { type = "ridge", scale = 300, octaves = 3, warp = 60 }
+rugged_part = { type = "mul", inputs = ["rugged", 70] }
+swell = { type = "noise", scale = 700, octaves = 2 }
+swell_part = { type = "mul", inputs = ["swell", 25] }
+rough = { type = "mul", inputs = ["hills", 5] }
+coast_range = { type = "mul", inputs = ["coastal", 80] }
+ground = { type = "add", inputs = [42, "rugged_part", "swell_part", "rough", "coast_range"] }
+
+# Valles en V con un río en el fondo.
+valley_noise = { type = "noise", scale = [2400, 800], octaves = 2, warp = 140 }
+valley_line = { type = "abs", input = "valley_noise" }
+valley_raw = { type = "smoothstep", input = "valley_line", from = 0.085, to = 0.012 }
+valley_reach = { type = "smoothstep", input = "across", from = 0.72, to = 0.58 }
+valley = { type = "mul", inputs = ["valley_reach", "valley_raw"] }
+carved = { type = "mix", a = "ground", b = -3, t = "valley" }
+
+shore = { type = "smoothstep", input = "across", from = 0.1, to = 0.17 }
+lowland = { type = "mix", a = "seafloor", b = "carved", t = "shore" }
+andes = { type = "mul", inputs = ["cordillera", 0.92] }
+height = { type = "add", inputs = ["lowland", "andes"] }
+
+[[surface]]
+below = 2
+top = "base:gravel"
+
+[[surface]]
+above = 270
+flatter = 2.1
+jitter = 8
+top = "base:snow"
+under = "base:stone"
+
+[[surface]]
+steeper = 2.1
+top = "base:stone"
+
+[[surface]]
+above = 210
+jitter = 10
+top = "base:stone"
+
+[[surface]]
+top = "base:moss"
+under = "base:dirt"
+
+# Árboles altos de copa ancha, coníferas que sobresalen y sotobosque.
+[[trees]]
+density = 0.5
+wood = "base:wood"
+leaves = ["base:leaves_dark", "base:leaves_dark", "base:leaves_green"]
+trunk = [6, 10]
+on = ["base:moss"]
+
+[[trees]]
+density = 0.18
+shape = "pine"
+wood = "base:wood"
+leaves = ["base:leaves_dark"]
+trunk = [10, 16]
+on = ["base:moss"]
+
+[[trees]]
+density = 0.12
+shape = "bush"
+wood = "base:wood"
+leaves = ["base:leaves_lime", "base:leaves_green"]
+on = ["base:moss"]

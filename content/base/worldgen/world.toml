@@ -1,0 +1,70 @@
+# El mundo de Tokikura: una franja tipo Chile, con el océano al oeste y la cordillera al
+# este. Los biomas se suceden de norte a sur en el orden de la lista.
+#
+# Los nodos de este archivo son comunes: cualquier bioma puede usarlos por su nombre, y
+# así la costa y la cordillera casan de un bioma al siguiente. Formato en content/README.md.
+
+width = 5120      # metros de oeste a este
+length = 32768    # metros de norte a sur
+
+biomes = [
+    # Zona norte
+    "desert",
+    "shattered_plains",
+    "flowering_desert",
+    # Zona centro
+    "mediterranean",
+    "plains",
+    "volcano_lakes",
+    # Zona sur
+    "temperate_forest",
+    "fjords",
+    "subantarctic",
+]
+
+blend = 700            # ancho de la mezcla entre dos biomas vecinos, en metros
+border_wobble = 700    # cuánto serpentea la frontera
+border_scale = 1700
+
+stone = "base:stone"
+water = "base:water"
+
+# Los grafos se evalúan de forma perezosa: en un `mul`, si un factor vale 0 los
+# siguientes no se calculan, y un `mix` con `t` en 0 o en 1 solo calcula la rama que usa.
+# Por eso las máscaras (`range`, `coastal`, `inland`) van siempre delante.
+[nodes]
+# --- Posición de oeste (0) a este (1), con la costa y la cordillera serpenteando ---
+coast_drift = { type = "noise", scale = [5000, 1700], octaves = 2 }
+coast_detail = { type = "noise", scale = 330, octaves = 1 }
+drift_part = { type = "mul", inputs = ["coast_drift", 0.07] }
+detail_part = { type = "mul", inputs = ["coast_detail", 0.014] }
+across = { type = "add", inputs = ["u", "drift_part", "detail_part"] }
+
+# --- Océano (oeste) ---
+seafloor_bumps = { type = "noise", scale = 220, octaves = 1 }
+seafloor_relief = { type = "mul", inputs = ["seafloor_bumps", 6] }
+seafloor = { type = "add", inputs = [-46, "seafloor_relief"] }
+
+# --- Cordillera de la costa: 1 en su franja, 0 fuera ---
+coastal_west = { type = "smoothstep", input = "across", from = 0.17, to = 0.27 }
+coastal_east = { type = "smoothstep", input = "across", from = 0.46, to = 0.36 }
+coastal = { type = "mul", inputs = ["coastal_west", "coastal_east"] }
+
+# --- Cordillera (este): `range` va de 0 en el valle a 1 en las cumbres ---
+range = { type = "smoothstep", input = "across", from = 0.58, to = 0.96 }
+inland = { type = "sub", a = 1, b = "range" }
+ridges = { type = "ridge", scale = 455, octaves = 4 }
+massif_noise = { type = "noise", scale = 1250, octaves = 2 }
+massif_part = { type = "mul", inputs = ["massif_noise", 0.8] }
+massif_sum = { type = "add", inputs = [0.7, "massif_part"] }
+massif = { type = "clamp", input = "massif_sum", min = 0.25, max = 1.2 }
+range_steep = { type = "pow", input = "range", exponent = 1.5 }
+peak_shape = { type = "mul", inputs = ["ridges", "ridges", "massif", 460] }
+peaks = { type = "add", inputs = [140, "peak_shape"] }
+range_body = { type = "mul", inputs = ["range_steep", "peaks"] }
+range_crests = { type = "mul", inputs = ["range", "ridges", 30] }
+# Altura que la cordillera suma al terreno, en metros (hasta ~600 en las cumbres).
+cordillera = { type = "add", inputs = ["range_body", "range_crests"] }
+
+# --- Relieve menudo de uso general, en [-1, 1] ---
+hills = { type = "noise", scale = 125, octaves = 3 }

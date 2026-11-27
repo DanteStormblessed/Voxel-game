@@ -1,0 +1,97 @@
+# Planicies: el valle central, llano y fértil, cruzado por ríos que bajan al mar.
+name = "Planicies"
+color = "#B0E66E"
+
+[nodes]
+flat_noise = { type = "noise", scale = 100, octaves = 1 }
+flat_part = { type = "mul", inputs = ["flat_noise", 5] }
+rough = { type = "mul", inputs = ["hills", 1.5] }
+flat = { type = "add", inputs = [22, "flat_part", "rough"] }
+
+coast_bumps = { type = "mul", inputs = ["hills", 14] }
+coast_height = { type = "add", inputs = [30, "coast_bumps"] }
+coast_range = { type = "mul", inputs = ["coastal", "coast_height"] }
+ground = { type = "add", inputs = ["flat", "coast_range"] }
+
+# Ríos: las líneas donde un ruido estirado de este a oeste pasa por cero. No suben a la
+# cordillera.
+river_noise = { type = "noise", scale = [2600, 520], octaves = 2, warp = 90 }
+river_line = { type = "abs", input = "river_noise" }
+river_raw = { type = "smoothstep", input = "river_line", from = 0.02, to = 0.012 }
+river_reach = { type = "smoothstep", input = "across", from = 0.7, to = 0.56 }
+river = { type = "mul", inputs = ["river_reach", "river_raw"] }
+carved = { type = "mix", a = "ground", b = -3, t = "river" }
+
+shore = { type = "smoothstep", input = "across", from = 0.1, to = 0.18 }
+lowland = { type = "mix", a = "seafloor", b = "carved", t = "shore" }
+height = { type = "add", inputs = ["lowland", "cordillera"] }
+
+# Arboledas en manchas, con algún árbol suelto entre ellas.
+grove = { type = "noise", scale = 300, octaves = 2 }
+grove_mask = { type = "smoothstep", input = "grove", from = 0.1, to = 0.55 }
+grove_part = { type = "mul", inputs = ["grove_mask", 0.35] }
+woods = { type = "add", inputs = [0.012] }
+
+[[surface]]
+below = 2
+top = "base:sand"
+
+[[surface]]
+above = 350
+flatter = 1.95
+jitter = 8
+top = "base:snow"
+under = "base:stone"
+
+[[surface]]
+steeper = 1.8
+top = "base:stone"
+
+[[surface]]
+above = 210
+jitter = 10
+top = "base:stone"
+
+[[surface]]
+top = "base:grass"
+under = "base:dirt"
+
+[[trees]]
+density = "woods"
+wood = "base:wood"
+leaves = ["base:leaves_green", "base:leaves_lime", "base:leaves_yellow"]
+trunk = [4, 6]
+on = ["base:grass"]
+
+[[plants]]
+density = 0.012
+block = "base:flower_red"
+on = ["base:grass"]
+
+[[plants]]
+density = 0.008
+block = "base:flower_yellow"
+on = ["base:grass"]
+
+[editor.layout]
+flat_noise = [-606, -416]
+rough = [-426, 82]
+coast_bumps = [-579, 479]
+river_noise = [-344, 840]
+river_reach = [308, -282]
+shore = [993, 262]
+grove = [-245, 1195]
+flat_part = [-101, 79]
+coast_height = [-153, 379]
+grove_mask = [19, 1068]
+river_line = [-65, 807]
+flat = [278, -1]
+coast_range = [255, 327]
+river_raw = [298, 646]
+grove_part = [291, 887]
+river = [742, 228]
+carved = [986, 0]
+lowland = [1230, -1]
+ground = [132, 1455]
+height = [870, 1455]
+woods = [132, 1683]

@@ -2,7 +2,8 @@
 
 use glam::Vec3;
 
-const MAX_INSTANCES: usize = 512;
+/// Cajas por frame. La mayoría son de la vista previa de un prefab (una por voxel visible).
+pub const MAX_INSTANCES: usize = 16384;
 
 /// Una caja orientada. Debe coincidir con las entradas de entity.wgsl.
 #[repr(C)]
@@ -34,6 +35,15 @@ impl EntityInstance {
         }
     }
 
+    /// Caja translúcida de las marcas: color con opacidad y, si se pide, rejilla de bloques.
+    pub fn panel(center: Vec3, size: Vec3, color: [f32; 4], grid: bool) -> EntityInstance {
+        EntityInstance {
+            center_yaw: [center.x, center.y, center.z, 0.0],
+            size: [size.x, size.y, size.z, if grid { 1.0 } else { 0.0 }],
+            color,
+        }
+    }
+
     /// Cuerpo y cabeza de un jugador cuyos ojos están en `eyes`.
     pub fn player(eyes: Vec3, yaw: f32, id: u32) -> [EntityInstance; 2] {
         let shirt = SHIRTS[id as usize % SHIRTS.len()];
@@ -51,20 +61,60 @@ impl EntityInstance {
 
 pub struct EntityRenderer {
     pipeline: wgpu::RenderPipeline,
+    /// Mapas de sombras (las marcas no dan sombra: no lo tienen).
+    shadow_pipeline: Option<wgpu::RenderPipeline>,
     instances: wgpu::Buffer,
     count: u32,
+    /// Las primeras `casters` cajas dan sombra (los jugadores).
+    casters: u32,
 }
 
 impl EntityRenderer {
+    /// Con `overlay`, las cajas son marcas: translúcidas, sin prueba de profundidad (se
+    /// ven a través de los bloques) y con las dos caras.
     pub fn new(
         device: &wgpu::Device,
         globals_layout: &wgpu::BindGroupLayout,
+        shadow_layout: &wgpu::BindGroupLayout,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
+        overlay: bool,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("entity shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/entity.wgsl").into()),
+        let source = if overlay { include_str!("shaders/overlay.wgsl") } else { include_str!("shaders/entity.wgsl") };
+        let shader = super::scene_shader(device, "entity shader", source);
+        let instance_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<EntityInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4],
+        }];
+        let shadow_pipeline = (!overlay).then(|| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("entity shadow pipeline layout"),
+                bind_group_layouts: &[shadow_layout],
+                push_constant_ranges: &[],
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("entity shadow pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &super::shadow_shader(device),
+                    entry_point: Some("vs_entity"),
+                    compilation_options: Default::default(),
+                    buffers: &instance_buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    // Como el terreno: solo las caras que dan la espalda a la luz.
+                    cull_mode: Some(wgpu::Face::Front),
+                    ..Default::default()
+                },
+                depth_stencil: Some(super::shadows::depth_state()),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: None,
+                multiview: None,
+                cache: None,
+            })
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("entity pipeline layout"),
@@ -87,13 +137,13 @@ impl EntityRenderer {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: (!overlay).then_some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Greater,
+                depth_write_enabled: !overlay,
+                depth_compare: if overlay { wgpu::CompareFunction::Always } else { wgpu::CompareFunction::Greater },
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -104,7 +154,7 @@ impl EntityRenderer {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: color_format,
-                    blend: None,
+                    blend: overlay.then_some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -117,12 +167,14 @@ impl EntityRenderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { pipeline, instances, count: 0 }
+        Self { pipeline, shadow_pipeline, instances, count: 0, casters: 0 }
     }
 
-    pub fn set(&mut self, queue: &wgpu::Queue, instances: &[EntityInstance]) {
+    /// Cajas de este frame; las primeras `casters` dan sombra.
+    pub fn set(&mut self, queue: &wgpu::Queue, instances: &[EntityInstance], casters: usize) {
         let instances = &instances[..instances.len().min(MAX_INSTANCES)];
         self.count = instances.len() as u32;
+        self.casters = casters.min(instances.len()) as u32;
         if !instances.is_empty() {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(instances));
         }
@@ -136,5 +188,14 @@ impl EntityRenderer {
         pass.set_bind_group(0, globals, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
         pass.draw(0..36, 0..self.count);
+    }
+
+    /// Dibuja en un mapa de sombras las cajas que dan sombra.
+    pub fn draw_shadow(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup) {
+        let Some(pipeline) = self.shadow_pipeline.as_ref().filter(|_| self.casters > 0) else { return };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, globals, &[]);
+        pass.set_vertex_buffer(0, self.instances.slice(..));
+        pass.draw(0..36, 0..self.casters);
     }
 }

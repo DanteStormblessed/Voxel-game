@@ -8,14 +8,21 @@
 //! Bucle: los eventos (conexiones, mensajes, chunks recién generados) se atienden en
 //! cuanto llegan; la simulación avanza a ticks fijos de `TICK_RATE` por segundo.
 
+pub mod biomes;
+mod builds;
 mod commands;
 mod drops;
+pub mod graph;
 mod noise;
+pub mod preview;
+mod prefabs;
 pub mod quic;
 mod storage;
 mod world;
-mod worldgen;
+pub mod worldgen;
+pub mod worldgen_doc;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
@@ -33,16 +40,18 @@ use kuravoxel_common::block::Block;
 use kuravoxel_common::content::{self, ContentData, ItemId};
 use kuravoxel_common::shape::BlockTable;
 use kuravoxel_common::lod::{self, LodTile, TileKey};
+use kuravoxel_common::prefab::Prefab;
 use kuravoxel_common::protocol::{
-    ClientMsg, DropState, PlayerId, PlayerState, ServerMsg, LOAD_MARGIN, PROTOCOL_VERSION, REACH, TICK_RATE,
-    UNLOAD_MARGIN, VERTICAL_RADIUS,
+    ClientMsg, DropState, PlayerId, PlayerState, ServerMsg, TerrainOp, TerrainStatus, WorldTime, LOAD_MARGIN, PROTOCOL_VERSION, REACH,
+    TICK_RATE, UNLOAD_MARGIN, VERTICAL_RADIUS,
 };
 
 use commands::Command;
 use storage::{Storage, WorldMeta};
 use drops::Drops;
 use world::{World, WorldCollider};
-use worldgen::TerrainBlocks;
+use biomes::{Terrain, WorldSource};
+use worldgen::WorldGen;
 
 /// Chunks que un jugador puede tener esperando generación a la vez. Acota el trabajo
 /// encargado por adelantado: si el jugador se mueve, lo cercano no queda en cola detrás.
@@ -57,6 +66,10 @@ const SAVE_INTERVAL: Duration = Duration::from_secs(5);
 const REACH_SLACK: f64 = 4.0;
 /// Cada cuánto se mira si los archivos de contenido han cambiado.
 const CONTENT_POLL: Duration = Duration::from_millis(500);
+/// Cada cuántos ticks se recuerda la hora a los clientes (entre medias la avanzan solos).
+const TIME_SYNC_TICKS: u32 = 10 * TICK_RATE;
+/// Cada cuánto se guarda la hora del mundo aunque nadie la haya cambiado.
+const META_INTERVAL: Duration = Duration::from_secs(60);
 /// Velocidad máxima aceptada a un cliente, en voxeles por segundo, y holgura fija.
 const MAX_SPEED: f64 = 160.0;
 const MOVE_SLACK: f64 = 8.0;
@@ -77,6 +90,8 @@ pub struct ServerConfig {
     /// Acepta cualquier posición del cliente sin validar la velocidad. Solo para
     /// herramientas de desarrollo en el servidor integrado.
     pub trust_movement: bool,
+    /// Genera el mundo entero con un solo bioma, para trabajarlo por separado.
+    pub solo_biome: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -89,6 +104,7 @@ impl Default for ServerConfig {
             max_view_distance: 16,
             max_far_distance: 160,
             trust_movement: false,
+            solo_biome: std::env::var("KURAVOXEL_BIOME").ok().filter(|name| !name.is_empty()),
         }
     }
 }
@@ -100,8 +116,11 @@ pub enum Event {
     Connect { id: PlayerId, sink: Sink, operator: bool },
     Message { id: PlayerId, msg: ClientMsg },
     Disconnect { id: PlayerId },
-    Generated(IVec3, Chunk),
-    LodGenerated(LodTile),
+    /// Con la generación del generador que los hizo (cambia al recargar el terreno).
+    Generated(u32, IVec3, Chunk),
+    LodGenerated(u32, LodTile),
+    /// Revisión de una columna de chunks editada, para el terreno lejano.
+    BuildsScanned { column: (i32, i32), seq: u64, built: Vec<builds::BuiltColumn> },
     Shutdown,
 }
 
@@ -160,7 +179,6 @@ pub fn start(config: ServerConfig) -> anyhow::Result<ServerHandle> {
     let loaded = content::load(dir)
         .and_then(|loaded| ContentData::assign(loaded, &known_states, &known_items))
         .with_context(|| format!("failed to load content from {}", dir.display()))?;
-    let blocks = TerrainBlocks::resolve(&loaded)?;
     log::info!(
         "content: {} blocks ({} states), {} items from {}",
         loaded.block_count(),
@@ -170,7 +188,25 @@ pub fn start(config: ServerConfig) -> anyhow::Result<ServerHandle> {
     );
 
     let seed = meta.as_ref().map_or(config.seed, |meta| meta.seed);
-    storage.write_meta(&world_meta(seed, &loaded))?;
+    let time = meta
+        .as_ref()
+        .map_or_else(WorldTime::default, |meta| WorldTime {
+            hours: meta.time,
+            day_length: meta.day_length,
+            day: meta.day,
+        })
+        .sanitized();
+    let terrain_fingerprint = biomes::fingerprint(dir);
+    let profiles = meta.as_ref().map(|meta| meta.profiles.clone()).unwrap_or_default();
+    let source = WorldSource::load_with(dir, &profiles)?.without_editor();
+    let terrain = Terrain::compile(&source, &loaded, seed, config.solo_biome.as_deref())
+        .context("failed to build the terrain generator")?;
+    log::info!(
+        "terrain: {} biomes{}",
+        terrain.bands().len(),
+        config.solo_biome.as_ref().map_or(String::new(), |name| format!(" (only {name})"))
+    );
+    storage.write_meta(&world_meta(seed, &loaded, time, &profiles))?;
     log::info!(
         "world: {} ({})",
         config.world_dir.display(),
@@ -182,8 +218,12 @@ pub fn start(config: ServerConfig) -> anyhow::Result<ServerHandle> {
     let thread = std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
-            let world = World::new(seed, blocks, storage, server_events);
-            Server::new(config, seed, Arc::new(loaded), fingerprint, world, inbox).run()
+            let world = World::new(seed, Arc::new(terrain), storage, server_events);
+            let mut server = Server::new(config, seed, time, Arc::new(loaded), fingerprint, world, inbox);
+            server.terrain_source = Some(source);
+            server.terrain_fingerprint = terrain_fingerprint;
+            server.terrain.profiles = profiles;
+            server.run()
         })
         .context("failed to spawn the server thread")?;
     Ok(ServerHandle {
@@ -193,8 +233,21 @@ pub fn start(config: ServerConfig) -> anyhow::Result<ServerHandle> {
     })
 }
 
-fn world_meta(seed: u32, content: &ContentData) -> WorldMeta {
-    WorldMeta { seed, blocks: content.state_names(), items: content.item_names() }
+fn world_meta(
+    seed: u32,
+    content: &ContentData,
+    time: WorldTime,
+    profiles: &BTreeMap<String, String>,
+) -> WorldMeta {
+    WorldMeta {
+        seed,
+        blocks: content.state_names(),
+        items: content.item_names(),
+        time: time.hours,
+        day_length: time.day_length,
+        day: time.day,
+        profiles: profiles.clone(),
+    }
 }
 
 struct Player {
@@ -231,6 +284,13 @@ struct Session {
     lod_pending: Vec<TileKey>,
     /// Teselas que el cliente debe soltar en cuanto tenga sus reemplazos.
     lod_retiring: Vec<TileKey>,
+
+    // --- Herramientas de construcción ---
+    /// Lo último que copió, cortó o cargó.
+    clipboard: Option<Arc<Prefab>>,
+    /// Cambios que puede deshacer, del más antiguo al más reciente: cómo estaban los
+    /// chunks antes de cada uno.
+    undo: Vec<Vec<(IVec3, Arc<Chunk>)>>,
 }
 
 struct Server {
@@ -248,7 +308,17 @@ struct Server {
     blocks: BlockTable,
     content_fingerprint: (usize, Option<SystemTime>),
     last_content_poll: Instant,
+    /// El terreno tal como está escrito en disco (el último que compiló) y su huella.
+    terrain_source: Option<WorldSource>,
+    terrain_fingerprint: (usize, Option<SystemTime>),
     drops: Drops,
+    /// Hora del mundo; avanza con los ticks.
+    time: WorldTime,
+    /// Última vez que se escribió `world.toml` y si la hora ha cambiado a mano desde entonces.
+    last_meta: Instant,
+    time_changed: bool,
+    /// Recarga en caliente, cambios a la espera y perfiles de los biomas en este mundo.
+    terrain: TerrainStatus,
 }
 
 fn chunk_of(pos: DVec3) -> IVec3 {
@@ -284,20 +354,29 @@ impl Server {
     fn new(
         config: ServerConfig,
         seed: u32,
+        time: WorldTime,
         content: Arc<ContentData>,
         content_fingerprint: (usize, Option<SystemTime>),
-        world: World,
+        mut world: World,
         inbox: Receiver<Event>,
     ) -> Self {
+        let blocks = BlockTable::new(&content);
+        world.set_block_table(&blocks);
         Self {
             world,
             seed,
             last_save: Instant::now(),
-            blocks: BlockTable::new(&content),
+            blocks,
             content,
             content_fingerprint,
             drops: Drops::default(),
+            time,
+            last_meta: Instant::now(),
+            time_changed: false,
             last_content_poll: Instant::now(),
+            terrain_source: None,
+            terrain_fingerprint: (0, None),
+            terrain: TerrainStatus { auto: true, ..TerrainStatus::default() },
             config,
             inbox,
             players: FxHashMap::default(),
@@ -340,6 +419,7 @@ impl Server {
                 }
             }
         }
+        self.time_changed = true;
         self.save_world();
         log::info!("server stopped");
     }
@@ -352,8 +432,19 @@ impl Server {
             }
             Event::Message { id, msg } => self.on_message(id, msg),
             Event::Disconnect { id } => self.remove_player(id),
-            Event::Generated(pos, chunk) => self.world.on_generated(pos, chunk),
-            Event::LodGenerated(tile) => self.world.on_lod_generated(tile),
+            Event::Generated(epoch, pos, chunk) => self.world.on_generated(epoch, pos, chunk),
+            Event::LodGenerated(epoch, tile) => self.world.on_lod_generated(epoch, tile),
+            Event::BuildsScanned { column, seq, built } => {
+                // Las teselas que cambian se reenvían a quien ya las tenga; el cliente
+                // sustituye la suya.
+                for tile in self.world.on_builds_scanned(column, seq, built) {
+                    for player in self.players.values_mut() {
+                        if player.session.as_ref().is_some_and(|s| s.lod_sent.contains(&tile.key)) {
+                            player.alive &= (player.sink)(ServerMsg::LodTile(tile.clone()));
+                        }
+                    }
+                }
+            }
             Event::Shutdown => return false,
         }
         true
@@ -440,6 +531,30 @@ impl Server {
                     self.broadcast(|| ServerMsg::DropRemoved { id: old });
                 }
             }
+            ClientMsg::Prefab(op) => {
+                let (text, ok) = match self.prefab_op(id, op) {
+                    Ok(text) => (text, true),
+                    Err(text) => (text, false),
+                };
+                self.send(id, ServerMsg::PrefabResult { text, ok });
+            }
+            ClientMsg::SetTime { hours, day_length } => {
+                let allowed = self.players.get(&id).is_some_and(|p| p.operator && p.session.is_some());
+                if allowed {
+                    self.set_time(hours, day_length);
+                }
+            }
+            ClientMsg::Terrain(op) => {
+                let allowed = self.players.get(&id).is_some_and(|p| p.operator && p.session.is_some());
+                if allowed {
+                    if let Err(problem) = self.terrain_op(op) {
+                        // El estado no cambia: se le vuelve a enviar con el problema.
+                        log::warn!("terrain: {problem}");
+                        let status = TerrainStatus { error: Some(problem), ..self.terrain.clone() };
+                        self.send(id, ServerMsg::TerrainStatus(status));
+                    }
+                }
+            }
             ClientMsg::Command { line } => {
                 let (text, ok) = match self.run_command(id, &line) {
                     Ok(text) => (text, true),
@@ -475,9 +590,58 @@ impl Server {
         match command {
             Command::Help => Ok(commands::HELP.join("\n")),
             Command::Seed => Ok(format!("Seed: {}", self.seed)),
+            Command::Biome => {
+                let terrain = self.world.generator.terrain().clone();
+                let here = terrain.biome_at(feet.x.floor() as i32, feet.z.floor() as i32);
+                let mut lines = vec![format!("You are in {} ({}).", here.name, here.id)];
+                for (index, biome) in terrain.bands().iter().enumerate() {
+                    let (from, to) = terrain.band_range(index);
+                    lines.push(format!("  {:<28} z {from} to {to}   (tp 0 ~ {})", biome.id, (from + to) / 2));
+                }
+                Ok(lines.join("\n"))
+            }
+            Command::Terrain(op) => self.terrain_op(op),
+            Command::TerrainProfiles => {
+                let dir = &self.config.content_dir;
+                let ids: Vec<String> =
+                    self.world.generator.terrain().bands().iter().map(|biome| biome.id.clone()).collect();
+                let mut lines = vec!["Profiles on disk (terrain profile <biome> <name|default>):".to_string()];
+                for id in ids {
+                    let profiles = biomes::list_profiles(dir, &id);
+                    let active = self.terrain.profiles.get(&id).map_or("default", String::as_str);
+                    let others = if profiles.is_empty() { "-".to_string() } else { profiles.join(", ") };
+                    lines.push(format!("  {id:<28} using {active:<14} available: {others}"));
+                }
+                Ok(lines.join("\n"))
+            }
             Command::Save => {
                 self.save_world();
                 Ok("World saved.".into())
+            }
+            Command::Time => Ok(self.describe_time()),
+            Command::TimeSet(hours) => {
+                self.set_time(Some(hours), None);
+                Ok(self.describe_time())
+            }
+            Command::TimeCycle(seconds) => {
+                self.set_time(None, Some(seconds));
+                Ok(self.describe_time())
+            }
+            Command::TimeDay(day) => {
+                self.set_day(day);
+                Ok(self.describe_time())
+            }
+            Command::TimeMoon(phase) => {
+                // Esta noche (o la de hoy, si aún es de día) pasa a tener esa fase: la
+                // noche `n` empieza la tarde del día `n`.
+                let cycle = kuravoxel_common::protocol::MOON_CYCLE_NIGHTS;
+                let wanted = (phase * cycle / 8 + cycle / 2) % cycle;
+                let before_dawn = self.time.hours < 6.0;
+                let tonight = if before_dawn { self.time.day.saturating_sub(1) } else { self.time.day };
+                let night = tonight + (wanted + cycle - tonight % cycle) % cycle;
+                let day = if before_dawn { night + 1 } else { night };
+                self.set_day(day);
+                Ok(self.describe_time())
             }
             Command::Players => {
                 let mut lines: Vec<String> = self
@@ -537,21 +701,60 @@ impl Server {
                 if filled.changed.is_empty() && filled.missing > 0 {
                     return Err("That box is not loaded: get closer to it.".into());
                 }
-                // Cada chunk cambiado se reenvía entero a quien lo tenga.
-                for &pos in &filled.changed {
-                    let Some(chunk) = self.world.loaded_chunk(pos) else { continue };
-                    for player in self.players.values_mut() {
-                        if player.session.as_ref().is_some_and(|s| s.sent.contains(&pos)) {
-                            let msg = ServerMsg::Chunk { pos: pos.to_array(), chunk: chunk.clone() };
-                            player.alive &= (player.sink)(msg);
-                        }
-                    }
-                }
+                self.resend_chunks(&filled.changed);
                 let mut text = format!("Filled {volume} blocks with {name}.");
                 if filled.missing > 0 {
                     text += &format!(" {} chunks were not loaded and were skipped.", filled.missing);
                 }
                 Ok(text)
+            }
+        }
+    }
+
+    /// Cambia la hora o la duración del día (lo que venga) y avisa a todos.
+    fn set_time(&mut self, hours: Option<f32>, day_length: Option<f32>) {
+        let changed = WorldTime {
+            hours: hours.unwrap_or(self.time.hours),
+            day_length: day_length.unwrap_or(self.time.day_length),
+            day: self.time.day,
+        }
+        .sanitized();
+        self.time = changed;
+        self.time_changed = true;
+        self.broadcast(|| ServerMsg::Time(changed));
+    }
+
+    /// La hora y el ritmo del día, para la consola.
+    fn describe_time(&self) -> String {
+        let cycle = match self.time.day_length {
+            length if length <= 0.0 => "time is stopped".to_string(),
+            length => format!("a day lasts {:.1} min", length / 60.0),
+        };
+        format!(
+            "Time: day {}, {} ({cycle}); tonight: {}",
+            self.time.day,
+            self.time.clock(),
+            self.time.moon_phase()
+        )
+    }
+
+    /// Cambia el día del mundo (y con él la fase de la luna) y avisa a todos.
+    fn set_day(&mut self, day: u32) {
+        self.time = WorldTime { day, ..self.time };
+        self.time_changed = true;
+        let time = self.time;
+        self.broadcast(|| ServerMsg::Time(time));
+    }
+
+    /// Reenvía enteros unos chunks que han cambiado en bloque a quien los tenga.
+    fn resend_chunks(&mut self, changed: &[IVec3]) {
+        for &pos in changed {
+            let Some(chunk) = self.world.loaded_chunk(pos) else { continue };
+            for player in self.players.values_mut() {
+                if player.session.as_ref().is_some_and(|s| s.sent.contains(&pos)) {
+                    let msg = ServerMsg::Chunk { pos: pos.to_array(), chunk: chunk.clone() };
+                    player.alive &= (player.sink)(msg);
+                }
             }
         }
     }
@@ -613,10 +816,10 @@ impl Server {
         let view_distance = view.clamp(3, self.config.max_view_distance) as i32;
         let far_distance = (far as i32).clamp(view_distance, self.config.max_far_distance as i32);
 
-        let ground = self.world.generator.height_at(0, 0).max(0);
+        let (x, ground, z) = spawn_column(&self.world.generator);
         // Los ojos, con los pies sobre el terreno. Si justo ahí hay un árbol, la física
         // del cliente saca al jugador hacia arriba.
-        let spawn = DVec3::new(0.5, ground as f64 + 1.0 + EYE_HEIGHT, 0.5);
+        let spawn = DVec3::new(x as f64 + 0.5, ground as f64 + 1.0 + EYE_HEIGHT, z as f64 + 0.5);
 
         let load_order = self
             .load_orders
@@ -633,6 +836,10 @@ impl Server {
         });
         // El contenido va antes que cualquier chunk: sin él no se sabe pintar los bloques.
         player.alive &= (player.sink)(ServerMsg::Content(self.content.clone()));
+        player.alive &= (player.sink)(ServerMsg::Time(self.time));
+        if player.operator {
+            player.alive &= (player.sink)(ServerMsg::TerrainStatus(self.terrain.clone()));
+        }
         player.session = Some(Session {
             name: name.clone(),
             pos: spawn,
@@ -649,6 +856,8 @@ impl Server {
             lod_sent: FxHashSet::default(),
             lod_pending: Vec::new(),
             lod_retiring: Vec::new(),
+            clipboard: None,
+            undo: Vec::new(),
         });
         log::info!("{name} (#{id}) joined: voxels {view_distance}, far {far_distance}");
 
@@ -812,6 +1021,13 @@ impl Server {
     /// Un paso de simulación: ítems sueltos y difusión de jugadores e ítems en movimiento.
     fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.world.update_builds();
+
+        self.time = self.time.advanced(1.0 / TICK_RATE as f32);
+        if self.tick % TIME_SYNC_TICKS == 0 {
+            let time = self.time;
+            self.broadcast(|| ServerMsg::Time(time));
+        }
 
         let collider = WorldCollider { world: &self.world, blocks: &self.blocks };
         let (moved, expired) = self.drops.step(Duration::from_secs(1) / TICK_RATE, &collider);
@@ -870,6 +1086,7 @@ impl Server {
         if self.last_content_poll.elapsed() >= CONTENT_POLL {
             self.last_content_poll = Instant::now();
             self.reload_content_if_changed();
+            self.reload_terrain_if_changed();
         }
 
         if self.last_save.elapsed() >= SAVE_INTERVAL {
@@ -884,10 +1101,23 @@ impl Server {
 
     fn save_world(&mut self) {
         self.last_save = Instant::now();
+        // La hora vive en `world.toml`: se escribe si alguien la cambió o cada cierto tiempo.
+        if self.time_changed || self.last_meta.elapsed() >= META_INTERVAL {
+            self.write_meta();
+        }
         match self.world.storage.save() {
             Ok(0) => {}
             Ok(regions) => log::info!("world saved ({regions} regions)"),
             Err(error) => log::error!("failed to save the world: {error:#}"),
+        }
+    }
+
+    fn write_meta(&mut self) {
+        self.last_meta = Instant::now();
+        self.time_changed = false;
+        let meta = world_meta(self.seed, &self.content, self.time, &self.terrain.profiles);
+        if let Err(error) = self.world.storage.write_meta(&meta) {
+            log::error!("failed to update world.toml: {error:#}");
         }
     }
 
@@ -907,7 +1137,12 @@ impl Server {
                 ContentData::assign(loaded, &states, &items)
             })
             // El generador ya tiene resueltos sus bloques: no pueden desaparecer.
-            .and_then(|data| TerrainBlocks::resolve(&data).map(|_| data));
+            .and_then(|data| match &self.terrain_source {
+                Some(source) => {
+                    Terrain::compile(source, &data, self.seed, self.config.solo_biome.as_deref()).map(|_| data)
+                }
+                None => Ok(data),
+            });
         match reloaded {
             Ok(data) => {
                 log::info!(
@@ -916,11 +1151,10 @@ impl Server {
                     data.item_count()
                 );
                 // Los bloques nuevos tienen número nuevo: la tabla del mundo debe saberlo.
-                if let Err(error) = self.world.storage.write_meta(&world_meta(self.seed, &data)) {
-                    log::error!("failed to update world.toml: {error:#}");
-                }
                 self.blocks = BlockTable::new(&data);
+                self.world.set_block_table(&self.blocks);
                 self.content = Arc::new(data);
+                self.write_meta();
                 for player in self.players.values_mut() {
                     if player.session.is_some() {
                         player.alive &= (player.sink)(ServerMsg::Content(self.content.clone()));
@@ -928,6 +1162,159 @@ impl Server {
                 }
             }
             Err(error) => log::error!("content not reloaded, keeping the previous one: {error:#}"),
+        }
+    }
+
+    /// Recarga en caliente del terreno: si cambia algún archivo de `worldgen/`, se
+    /// compila de nuevo y, si la recarga automática está activada, todo lo que no esté
+    /// editado se regenera y se reenvía. Si no, el cambio espera a `TerrainOp::Apply`.
+    /// Un error deja el terreno anterior.
+    fn reload_terrain_if_changed(&mut self) {
+        let fingerprint = biomes::fingerprint(&self.config.content_dir);
+        if fingerprint == self.terrain_fingerprint {
+            return;
+        }
+        self.terrain_fingerprint = fingerprint;
+        self.check_terrain(false);
+    }
+
+    /// Compila el terreno de los archivos (con los perfiles de este mundo) y lo usa si
+    /// cambia algo y toca: con la recarga automática o si se pide (`apply`).
+    fn check_terrain(&mut self, apply: bool) {
+        let before = self.terrain.clone();
+        self.update_terrain(apply);
+        if self.terrain != before {
+            self.send_terrain_status();
+        }
+    }
+
+    /// Envía el estado del terreno a quien puede cambiarlo.
+    fn send_terrain_status(&mut self) {
+        let status = self.terrain.clone();
+        for player in self.players.values_mut() {
+            if player.operator && player.session.is_some() {
+                player.alive &= (player.sink)(ServerMsg::TerrainStatus(status.clone()));
+            }
+        }
+    }
+
+    /// Una orden sobre el terreno (de la consola o del editor de biomas). Devuelve el
+    /// texto para la consola.
+    fn terrain_op(&mut self, op: TerrainOp) -> Result<String, String> {
+        match op {
+            TerrainOp::Status => {}
+            TerrainOp::Auto(on) => {
+                self.terrain.auto = on;
+                // Al volver a activarla se usa ya lo que estuviera esperando.
+                self.update_terrain(false);
+            }
+            TerrainOp::Apply => self.update_terrain(true),
+            TerrainOp::Profile { biome, profile } => {
+                let id = match &self.terrain_source {
+                    Some(source) => source.resolve(&biome).map_err(|error| format!("{error:#}"))?.to_string(),
+                    None => biome,
+                };
+                match profile {
+                    Some(profile) => {
+                        if !biomes::valid_profile_name(&profile) {
+                            return Err(format!(
+                                "\"{profile}\" is not a valid profile name: use lowercase letters, digits and _"
+                            ));
+                        }
+                        if biomes::find_profile(&self.config.content_dir, &id, &profile).is_none() {
+                            return Err(format!("{id} has no profile called \"{profile}\" (terrain profiles lists them)"));
+                        }
+                        self.terrain.profiles.insert(id, profile);
+                    }
+                    None => {
+                        self.terrain.profiles.remove(&id);
+                    }
+                }
+                self.write_meta();
+                self.update_terrain(false);
+            }
+        }
+        self.send_terrain_status();
+        Ok(self.describe_terrain())
+    }
+
+    fn describe_terrain(&self) -> String {
+        let status = &self.terrain;
+        let mut lines = vec![format!(
+            "Terrain: live reload {}{}",
+            if status.auto { "on" } else { "off" },
+            if status.pending { "; changes are waiting (terrain apply)" } else { "" }
+        )];
+        if let Some(error) = &status.error {
+            lines.push(format!("The files have an error, the world keeps the previous terrain: {error}"));
+        }
+        if status.profiles.is_empty() {
+            lines.push("Every biome uses its default file.".into());
+        }
+        for (biome, profile) in &status.profiles {
+            lines.push(format!("  {biome:<28} profile {profile}"));
+        }
+        lines.join("\n")
+    }
+
+    fn update_terrain(&mut self, apply: bool) {
+        let dir = &self.config.content_dir;
+        let compiled = WorldSource::load_with(dir, &self.terrain.profiles).map(WorldSource::without_editor).and_then(|source| {
+            let terrain = Terrain::compile(&source, &self.content, self.seed, self.config.solo_biome.as_deref())?;
+            Ok((source, terrain))
+        });
+        let (source, terrain) = match compiled {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                log::error!("terrain not reloaded, keeping the previous one: {error:#}");
+                self.terrain.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        self.terrain.error = None;
+        // Solo ha cambiado lo que no genera nada (comentarios, el lienzo del editor): no
+        // hay que regenerar el mundo.
+        if self.terrain_source.as_ref() == Some(&source) {
+            self.terrain.pending = false;
+            return;
+        }
+        if !apply && !self.terrain.auto {
+            if !self.terrain.pending {
+                log::info!("terrain changed: waiting to be applied");
+            }
+            self.terrain.pending = true;
+            return;
+        }
+        self.terrain.pending = false;
+        log::info!("terrain reloaded: {} biomes", terrain.bands().len());
+        self.terrain_source = Some(source);
+        self.world.set_generator(WorldGen::new(self.seed, Arc::new(terrain)));
+
+        // Los clientes sustituyen lo que ya tienen según les llega la versión nueva.
+        for player in self.players.values_mut() {
+            let Some(session) = player.session.as_mut() else { continue };
+            let center = chunk_of(session.pos);
+            // Lo que cae dentro de la lista de carga se reenviará; el resto se suelta.
+            let (reach, view) = ((session.view_distance + LOAD_MARGIN) as i64, session.view_distance);
+            let unload: Vec<[i32; 3]> = session
+                .sent
+                .drain()
+                .filter(|&pos| {
+                    let d = pos - center;
+                    let flat = (d.x as i64).pow(2) + (d.z as i64).pow(2);
+                    flat > reach * reach || d.y.abs() > VERTICAL_RADIUS || !in_keep_volume(pos, center, view)
+                })
+                .map(|pos| pos.to_array())
+                .collect();
+            if !unload.is_empty() {
+                player.alive &= (player.sink)(ServerMsg::UnloadChunks(unload));
+            }
+            session.center = Some(center);
+            session.cursor = 0;
+            session.pending.clear();
+            retarget_lod(session, center);
+            let resend: Vec<TileKey> = session.lod_sent.drain().collect();
+            session.lod_pending.extend(resend);
         }
     }
 
@@ -955,6 +1342,24 @@ impl Server {
         );
         log::debug!("gc: {} chunks in memory", world.chunk_count());
     }
+}
+
+/// Dónde aparecen los jugadores: la columna en tierra firme más cercana al origen (x,
+/// altura del suelo, z). Si el origen cae en un río o en el mar, se busca alrededor.
+fn spawn_column(generator: &WorldGen) -> (i32, i32, i32) {
+    const STEP: i32 = 8;
+    for ring in 0..96 {
+        let radius = ring * STEP;
+        for offset in (-radius..=radius).step_by(STEP as usize) {
+            for (x, z) in [(offset, -radius), (offset, radius), (-radius, offset), (radius, offset)] {
+                let ground = generator.height_at(x, z);
+                if ground > worldgen::SEA_LEVEL {
+                    return (x, ground, z);
+                }
+            }
+        }
+    }
+    (0, generator.height_at(0, 0).max(worldgen::SEA_LEVEL), 0)
 }
 
 /// Recalcula qué teselas de terreno lejano necesita el jugador.

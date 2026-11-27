@@ -8,6 +8,7 @@ use kuravoxel_ui::{Element, Screen};
 
 use super::style;
 use crate::settings::{self, UserSettings};
+use kuravoxel_client::render::ShadowQuality;
 
 /// Lo que la pantalla pide al juego.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +28,10 @@ pub enum Message {
     MouseSensitivity(f32),
     Vsync(bool),
     UiScale(f32),
+    /// Calidad de las sombras, como posición en `ShadowQuality::ALL`.
+    Shadows(u8),
+    /// Tope de fps, como posición en `settings::MAX_FPS_CHOICES`.
+    MaxFps(u8),
     Reset,
     Done,
     Cancel,
@@ -69,6 +74,14 @@ impl Screen for SettingsScreen {
             Message::MouseSensitivity(factor) => draft.mouse_sensitivity = factor,
             Message::Vsync(on) => draft.vsync = on,
             Message::UiScale(scale) => draft.ui_scale = scale,
+            Message::Shadows(level) => {
+                let quality = ShadowQuality::ALL[(level as usize).min(ShadowQuality::ALL.len() - 1)];
+                draft.shadows = quality.name().into();
+            }
+            Message::MaxFps(index) => {
+                let index = (index as usize).min(settings::MAX_FPS_CHOICES.len() - 1);
+                draft.max_fps = settings::MAX_FPS_CHOICES[index].into();
+            }
             // El nombre no es una preferencia que "restaurar": se conserva.
             Message::Reset => {
                 *draft = UserSettings { player_name: draft.player_name.clone(), ..UserSettings::default() }
@@ -131,6 +144,28 @@ impl Screen for SettingsScreen {
                 format!("{:.0}%", draft.ui_scale * 100.0)
             ),
             setting(
+                "Shadows",
+                slider(
+                    0..=(ShadowQuality::ALL.len() as u8 - 1),
+                    ShadowQuality::ALL.iter().position(|q| *q == draft.shadow_quality()).unwrap_or(0) as u8,
+                    Message::Shadows
+                ),
+                draft.shadows.clone()
+            ),
+            setting(
+                "Max FPS",
+                slider(
+                    0..=(settings::MAX_FPS_CHOICES.len() as u8 - 1),
+                    max_fps_index(&draft.max_fps),
+                    Message::MaxFps
+                ),
+                match draft.max_fps.as_str() {
+                    "monitor" => "Monitor".into(),
+                    "unlimited" => "Unlimited".into(),
+                    fps => fps.to_string(),
+                }
+            ),
+            setting(
                 "Vertical sync",
                 row![checkbox(draft.vsync).on_toggle(Message::Vsync)].width(Length::Fill),
                 if draft.vsync { "On".into() } else { "Off".into() }
@@ -150,9 +185,34 @@ impl Screen for SettingsScreen {
     }
 }
 
+/// Posición del valor en la lista del deslizador; un número escrito a mano cae en la
+/// opción más cercana por debajo.
+fn max_fps_index(value: &str) -> u8 {
+    let choices = settings::MAX_FPS_CHOICES;
+    if let Some(index) = choices.iter().position(|choice| *choice == value) {
+        return index as u8;
+    }
+    let fps: u32 = value.parse().unwrap_or(0);
+    choices
+        .iter()
+        .rposition(|choice| choice.parse::<u32>().is_ok_and(|choice| choice <= fps))
+        .unwrap_or(0) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_fps_slider_walks_the_choices() {
+        let mut screen = screen();
+        assert_eq!(max_fps_index(&screen.draft.max_fps), 0, "monitor by default");
+        screen.update(Message::MaxFps(6));
+        assert_eq!(screen.draft.max_fps, "144");
+        screen.update(Message::MaxFps(200));
+        assert_eq!(screen.draft.max_fps, "unlimited");
+        assert_eq!(max_fps_index("100"), 4, "a hand-written number shows as the closest choice below");
+    }
 
     fn screen() -> SettingsScreen {
         let mut screen = SettingsScreen::default();

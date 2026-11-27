@@ -1,0 +1,4 @@
+name = "Roca roja"
+color = "#A85C3E"
+category = "Terreno"
+tags = ["natural", "roca"]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use kuravoxel_client::session::SessionInfo;
 use kuravoxel_common::content::ContentData;
-use kuravoxel_ui::core::{Alignment, Color, Font, Length};
+use kuravoxel_ui::core::{Alignment, Color, Font, Length, Padding};
 use kuravoxel_ui::widget::{bottom_center, center, center_x, column, container, row, space, stack, text, Column};
 use kuravoxel_ui::{Element, Screen};
 
@@ -33,6 +33,11 @@ pub struct Hud {
     loaded: bool,
     /// Aviso breve en lo alto de la pantalla (p. ej. el modo de juego recién elegido).
     pub notice: Option<String>,
+    /// Líneas de la herramienta de construcción activa (vacío = ninguna).
+    pub tool: Vec<String>,
+    /// Rótulos sobre el mundo (las medidas de la selección): posición en pantalla, de
+    /// 0 a 1 desde la esquina superior izquierda, y texto.
+    pub labels: Vec<([f32; 2], String)>,
     /// Datos de depuración a mostrar (F3).
     debug: Option<Debug>,
 }
@@ -124,6 +129,42 @@ impl Screen for Hud {
                 .into(),
             );
         }
+        for (position, label) in &self.labels {
+            // Sin conocer el tamaño de la ventana: el espacio se reparte en proporción.
+            let portion = |value: f32| ((value.clamp(0.0, 1.0) * 1000.0) as u16).clamp(1, 999);
+            let (x, y) = (portion(position[0]), portion(position[1]));
+            let tag = container(text(label).size(15).color(Color::WHITE))
+                .padding([1, 6])
+                .style(|_| container::background(Color::from_rgba(0.0, 0.0, 0.0, 0.6)));
+            layers.push(
+                column![
+                    space().height(Length::FillPortion(y)),
+                    row![
+                        space().width(Length::FillPortion(x)),
+                        tag,
+                        space().width(Length::FillPortion(1000 - x))
+                    ],
+                    space().height(Length::FillPortion(1000 - y)),
+                ]
+                .into(),
+            );
+        }
+        if !self.tool.is_empty() {
+            let lines = self.tool.iter().map(|line| text(line).size(13).font(Font::MONOSPACE).into());
+            layers.push(
+                container(row![
+                    space().width(Length::Fill),
+                    container(Column::with_children(lines).spacing(3))
+                        .padding(10)
+                        .style(|_| container::background(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
+                ])
+                // Por debajo del aviso que sale centrado en lo alto.
+                .padding(Padding::new(10.0).top(72.0))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            );
+        }
         if let Some(debug) = &self.debug {
             let [x, y, z] = debug.position;
             let target = debug
@@ -180,6 +221,8 @@ mod tests {
         hotbar.sync(&info.content);
         hud.crosshair = true;
         hud.notice = Some("Creative".into());
+        hud.tool = vec!["Selection wand".into(), "LMB corner 1".into()];
+        hud.labels = vec![([0.5, 0.25], "12".into())];
         hud.sync(&info, &Arc::new(Icons::new(&info.content)), &hotbar, "Creative", true);
         assert!(hud.debug.is_some());
         let _ = hud.view();

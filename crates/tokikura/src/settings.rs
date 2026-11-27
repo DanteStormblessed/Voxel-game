@@ -7,7 +7,8 @@
 use std::ops::RangeInclusive;
 use std::path::Path;
 
-use kuravoxel_client::session::ClientSettings;
+use kuravoxel_client::render::ShadowQuality;
+use kuravoxel_client::session::{ClientSettings, FrameLimit};
 use serde::{Deserialize, Serialize};
 
 pub const VIEW_DISTANCE: RangeInclusive<u8> = 3..=16;
@@ -16,6 +17,25 @@ pub const FOV: RangeInclusive<f32> = 50.0..=110.0;
 pub const MOUSE_SENSITIVITY: RangeInclusive<f32> = 0.1..=3.0;
 pub const UI_SCALE: RangeInclusive<f32> = 0.75..=2.0;
 const MAX_NAME: usize = 24;
+/// Valores de `max_fps` que ofrece la pantalla de ajustes, en orden. A mano (o con `set
+/// fps`) vale cualquier número de `MAX_FPS`.
+pub const MAX_FPS_CHOICES: [&str; 10] =
+    ["monitor", "30", "60", "75", "90", "120", "144", "165", "240", "unlimited"];
+pub const MAX_FPS: RangeInclusive<u32> = 30..=240;
+/// Frames por segundo mientras no se juega (ventana sin foco, pausa o menús).
+const BACKGROUND_FPS: u32 = 30;
+
+/// `monitor` (los que muestra la pantalla), `unlimited` o un número de `MAX_FPS`.
+pub fn frame_limit(value: &str) -> Option<FrameLimit> {
+    match value.trim() {
+        "monitor" => Some(FrameLimit::Display),
+        "unlimited" => Some(FrameLimit::Unlimited),
+        number => {
+            let fps: u32 = number.parse().ok()?;
+            Some(FrameLimit::Fps(fps.clamp(*MAX_FPS.start(), *MAX_FPS.end())))
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -32,6 +52,13 @@ pub struct UserSettings {
     pub vsync: bool,
     /// Tamaño de la interfaz (1 = normal).
     pub ui_scale: f32,
+    /// Calidad de las sombras: `off`, `low`, `medium` o `high`.
+    pub shadows: String,
+    /// Tope de frames por segundo: `monitor`, `unlimited` o un número (30-240).
+    pub max_fps: String,
+    /// Desarrollo (no se guarda): frames por segundo sin foco o en pausa; 0 = sin rebaja.
+    #[serde(skip)]
+    pub background_fps: u32,
 }
 
 impl Default for UserSettings {
@@ -44,6 +71,9 @@ impl Default for UserSettings {
             mouse_sensitivity: 1.0,
             vsync: true,
             ui_scale: 1.0,
+            shadows: ShadowQuality::default().name().into(),
+            max_fps: "monitor".into(),
+            background_fps: BACKGROUND_FPS,
         }
     }
 }
@@ -71,7 +101,23 @@ impl UserSettings {
         self.mouse_sensitivity =
             clamp_f32(self.mouse_sensitivity, MOUSE_SENSITIVITY, defaults.mouse_sensitivity);
         self.ui_scale = clamp_f32(self.ui_scale, UI_SCALE, defaults.ui_scale);
+        if ShadowQuality::parse(&self.shadows).is_none() {
+            self.shadows = defaults.shadows;
+        }
+        self.max_fps = match frame_limit(&self.max_fps) {
+            Some(FrameLimit::Fps(fps)) => fps.to_string(),
+            Some(_) => self.max_fps.trim().to_string(),
+            None => defaults.max_fps,
+        };
         self
+    }
+
+    pub fn frame_limit(&self) -> FrameLimit {
+        frame_limit(&self.max_fps).unwrap_or_default()
+    }
+
+    pub fn shadow_quality(&self) -> ShadowQuality {
+        ShadowQuality::parse(&self.shadows).unwrap_or_default()
     }
 
     /// Lee los ajustes; si el archivo no existe o no se entiende, los de por defecto.
@@ -108,6 +154,9 @@ impl UserSettings {
             vsync: self.vsync,
             fov_degrees: self.fov,
             mouse_sensitivity: self.mouse_sensitivity,
+            shadows: self.shadow_quality(),
+            max_fps: self.frame_limit(),
+            background_fps: self.background_fps,
         }
     }
 
@@ -121,6 +170,8 @@ impl UserSettings {
             format!("sensitivity = {:.2}", self.mouse_sensitivity),
             format!("vsync = {}", self.vsync),
             format!("ui_scale = {:.2}", self.ui_scale),
+            format!("shadows = {}", self.shadows),
+            format!("fps = {}", self.max_fps),
         ]
     }
 
@@ -138,6 +189,18 @@ impl UserSettings {
             "fov" => changed.fov = number(value)?,
             "sensitivity" => changed.mouse_sensitivity = number(value)?,
             "ui_scale" => changed.ui_scale = number(value)?,
+            "shadows" => {
+                if ShadowQuality::parse(value).is_none() {
+                    return Err("Use off, low, medium or high.".into());
+                }
+                changed.shadows = value.to_string();
+            }
+            "fps" => {
+                if frame_limit(value).is_none() {
+                    return Err("Use monitor, unlimited or a number from 30 to 240.".into());
+                }
+                changed.max_fps = value.trim().to_string();
+            }
             "vsync" => {
                 changed.vsync = match value {
                     "on" | "true" | "1" => true,
@@ -166,8 +229,13 @@ mod tests {
             mouse_sensitivity: 99.0,
             vsync: false,
             ui_scale: 0.0,
+            shadows: "ultra".into(),
+            max_fps: "fast".into(),
+            background_fps: 30,
         }
         .sanitized();
+        assert_eq!(settings.max_fps, "monitor");
+        assert_eq!(settings.shadows, "medium");
         assert!(!settings.player_name.trim().is_empty());
         assert_eq!(settings.view_distance, 16);
         assert_eq!(settings.far_distance, 16, "far terrain never ends before the voxels");
@@ -207,8 +275,27 @@ mod tests {
         assert!(settings.set("gravity", "1").unwrap_err().contains("Unknown setting"));
         assert!(settings.set("fov", "wide").is_err());
         assert!(settings.set("vsync", "maybe").is_err());
+        assert!(settings.set("shadows", "soft").is_err());
+        settings.set("shadows", "high").unwrap();
+        assert_eq!(settings.client().shadows, ShadowQuality::High);
         settings.set("view", "99").unwrap();
         assert_eq!(settings.view_distance, 16);
         assert_eq!(settings.client().fov_degrees, settings.fov);
+    }
+
+    #[test]
+    fn max_fps_accepts_monitor_unlimited_and_numbers() {
+        assert_eq!(UserSettings::default().frame_limit(), FrameLimit::Display);
+        let mut settings = UserSettings::default();
+        settings.set("fps", "144").unwrap();
+        assert_eq!(settings.frame_limit(), FrameLimit::Fps(144));
+        settings.set("fps", "1000").unwrap();
+        assert_eq!(settings.max_fps, "240", "out of range numbers are brought back");
+        settings.set("fps", "unlimited").unwrap();
+        assert_eq!(settings.client().max_fps, FrameLimit::Unlimited);
+        assert!(settings.set("fps", "fast").is_err());
+        for choice in MAX_FPS_CHOICES {
+            assert!(frame_limit(choice).is_some(), "{choice}");
+        }
     }
 }

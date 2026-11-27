@@ -8,28 +8,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kuravoxel_client::app::{Context, Game, Host};
+use kuravoxel_client::app::{Context, Game, Host, WindowKey, WindowSpec};
 use kuravoxel_client::reexports::winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use kuravoxel_client::reexports::winit::keyboard::{KeyCode, PhysicalKey};
 use kuravoxel_client::reexports::wgpu;
 use kuravoxel_client::player::{ViewKind, THIRD_PERSON_MAX};
-use kuravoxel_client::render::OverlayTarget;
-use kuravoxel_client::session::{SessionConfig, SessionEvent, SessionInfo, SessionMode};
+use kuravoxel_client::render::{Environment, OverlayTarget};
+use glam::IVec3;
+use kuravoxel_client::session::{Overlay, SessionConfig, SessionEvent, SessionInfo, SessionMode};
 use kuravoxel_common::block::Block;
 use kuravoxel_common::content::ContentData;
+use kuravoxel_common::physics::EYE_HEIGHT;
+use kuravoxel_common::protocol::{PrefabOp, TerrainStatus};
 use kuravoxel_ui::{IcedLayer, Screen};
 
+use crate::biome_preview::PreviewWorker;
+use crate::builder::{self, Builder, RegionAction};
 use crate::commands::{self, Command};
+use crate::environment;
 use crate::game_mode::GameMode;
 use crate::hotbar::{self, Hotbar};
 use crate::icons::Icons;
 use crate::log_capture::LogCapture;
+use crate::screens::biome_editor::{self, BiomeEditor};
 use crate::screens::console::{self, Console, Kind};
 use crate::screens::hud::Hud;
 use crate::screens::inventory::{self, Inventory};
 use crate::screens::main_menu::{self, MainMenu};
 use crate::screens::pause_menu::{self, PauseMenu};
+use crate::screens::prefabs::{self, Prefabs};
 use crate::screens::settings::{self as settings_screen, SettingsScreen};
+use crate::screens::sky::{self, Sky};
 use crate::screens::world_create::{self, WorldCreate};
 use crate::screens::world_select::{self, WorldSelect};
 use crate::settings::UserSettings;
@@ -38,6 +47,9 @@ use crate::settings::UserSettings;
 const DEFAULT_THIRD_PERSON: f32 = 5.0;
 /// Tiempo que se ve el aviso de cambio de modo de juego.
 const NOTICE_TIME: Duration = Duration::from_secs(2);
+/// La ventana del editor de biomas (`Context::open_window`).
+const EDITOR_WINDOW: WindowKey = 1;
+const EDITOR_SIZE: [f64; 2] = [1440.0, 900.0];
 
 /// Algo pedido con una tecla que necesita al motor: se resuelve en el siguiente `update`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,6 +62,18 @@ enum Action {
     Zoom(i32),
     /// Tirar al suelo el ítem de la ranura activa.
     DropActive,
+    /// Copiar, cortar o vaciar la selección.
+    Region(RegionAction),
+    /// Deshacer el último cambio de construcción.
+    Undo,
+    /// Empezar a colocar el portapapeles, o dejar de hacerlo.
+    TogglePaste,
+    /// Girar un cuarto de vuelta lo que se está colocando.
+    Rotate,
+    /// Subir (> 0) o bajar lo que se está colocando.
+    Lift(i32),
+    /// Pedir al servidor la lista de prefabs guardados.
+    RefreshPrefabs,
 }
 
 /// Lo que se decide al arrancar y no cambia con el juego en marcha.
@@ -58,10 +82,12 @@ pub struct Config {
     pub content_dir: PathBuf,
     /// Archivo donde se guardan los ajustes del jugador.
     pub settings_path: PathBuf,
+    /// Archivo donde se guarda el ambiente (cielo, luz y sombras).
+    pub environment_path: PathBuf,
     /// Semilla de los mundos que se crean sin elegir una (línea de comandos).
     pub seed: u32,
     /// Desarrollo: pantalla que se abre sola al entrar en un mundo (`pause`, `inventory`,
-    /// `console`, o `debug` para los datos de F3). Sirve para capturarlas.
+    /// `console`, `prefabs`, o `debug` para los datos de F3). Sirve para capturarlas.
     pub dev_open: Option<String>,
     /// Desarrollo: líneas de consola que se ejecutan solas al entrar en un mundo.
     pub dev_console: Vec<String>,
@@ -87,11 +113,18 @@ enum Shown {
     Pause,
     Inventory,
     Console,
+    Prefabs,
+    /// Panel de cielo y luz: no tapa el mundo.
+    Sky,
 }
 
 pub struct Tokikura {
     config: Config,
     settings: UserSettings,
+    /// Cielo, luz y sombras: lo que se retoca con el panel o con `env`.
+    environment: Environment,
+    /// El ambiente tiene cambios sin guardar en su archivo.
+    environment_unsaved: bool,
     launch: Option<Launch>,
     logs: LogCapture,
     /// Capa de Iced; existe desde que el motor tiene dispositivo gráfico.
@@ -115,6 +148,8 @@ pub struct Tokikura {
     third_person_distance: f32,
     /// Alt pulsado: la rueda mueve la cámara en vez de la barra.
     alt: bool,
+    /// Ctrl pulsado: C, X, V y Z son de la herramienta de construcción.
+    ctrl: bool,
     actions: Vec<Action>,
     /// Aviso en pantalla y hasta cuándo se ve.
     notice: Option<(String, Instant)>,
@@ -124,6 +159,15 @@ pub struct Tokikura {
     /// Iconos de los ítems de `content`.
     icons: Arc<Icons>,
     hotbar: Hotbar,
+    /// Herramienta de construcción: selección, portapapeles y pegado.
+    builder: Builder,
+    /// Lo último que se le dijo al motor: modo herramienta y marcas sobre el mundo.
+    tool_sent: bool,
+    overlay_sent: Overlay,
+    /// Empezar a colocar en cuanto llegue el prefab pedido desde el menú.
+    place_when_loaded: bool,
+    /// La próxima lista de prefabs también se escribe en la consola (`prefab list`).
+    list_to_console: bool,
 
     main_menu: MainMenu,
     world_select: WorldSelect,
@@ -133,12 +177,30 @@ pub struct Tokikura {
     hud: Hud,
     inventory: Inventory,
     console: Console,
+    prefabs_screen: Prefabs,
+    sky_screen: Sky,
+    biome_editor: BiomeEditor,
+    /// El editor de biomas va en su propia ventana: si debe estar abierta, si ya se le ha
+    /// pedido al motor y la capa de Iced de esa ventana (existe mientras está abierta).
+    editor_open: bool,
+    editor_window_sent: bool,
+    editor_ui: Option<IcedLayer>,
+    /// Lo último que ha dicho el servidor del terreno (solo al anfitrión).
+    terrain_status: TerrainStatus,
+    /// Hilo de las vistas previas del editor de biomas; se arranca al abrirlo.
+    previews: Option<PreviewWorker>,
+    /// Mundo abierto en esta partida (si la aloja este juego) y semilla con la que se
+    /// creó si era nuevo.
+    world_dir: Option<PathBuf>,
+    world_seed: u32,
 }
 
 impl Tokikura {
     pub fn new(config: Config, settings: UserSettings, launch: Launch, logs: LogCapture) -> Self {
         let world_select = WorldSelect::new(config.worlds_dir.clone());
         Self {
+            environment: environment::load(&config.environment_path),
+            environment_unsaved: false,
             config,
             settings,
             launch: Some(launch),
@@ -155,11 +217,17 @@ impl Tokikura {
             camera_distance: 0.0,
             third_person_distance: DEFAULT_THIRD_PERSON,
             alt: false,
+            ctrl: false,
             actions: Vec::new(),
             notice: None,
             content: Arc::default(),
             icons: Arc::default(),
             hotbar: Hotbar::default(),
+            builder: Builder::default(),
+            tool_sent: false,
+            overlay_sent: Overlay::default(),
+            place_when_loaded: false,
+            list_to_console: false,
             main_menu: MainMenu::default(),
             world_select,
             world_create: WorldCreate::default(),
@@ -168,6 +236,16 @@ impl Tokikura {
             hud: Hud::default(),
             inventory: Inventory::default(),
             console: Console::default(),
+            prefabs_screen: Prefabs::default(),
+            sky_screen: Sky::default(),
+            biome_editor: BiomeEditor::default(),
+            editor_open: false,
+            editor_window_sent: false,
+            editor_ui: None,
+            terrain_status: TerrainStatus::default(),
+            previews: None,
+            world_dir: None,
+            world_seed: 0,
         }
     }
 
@@ -209,6 +287,82 @@ impl Tokikura {
         }
     }
 
+    fn open_biome_editor(&mut self) {
+        // La semilla del mundo abierto: las vistas previas deben coincidir con él.
+        let seed = self
+            .world_dir
+            .as_ref()
+            .and_then(|dir| crate::worlds::read_seed(&dir.join("world.toml")))
+            .unwrap_or(self.world_seed);
+        self.biome_editor.open(self.config.content_dir.clone(), seed);
+        self.biome_editor.set_terrain_status(&self.terrain_status);
+        self.previews.get_or_insert_with(PreviewWorker::spawn);
+        // Se abre en su propia ventana: la del juego sigue jugándose.
+        self.editor_open = true;
+    }
+
+    /// Atajos de la ventana del editor de biomas. Devuelve `true` si el evento era uno.
+    fn editor_shortcut(&mut self, event: &WindowEvent) -> bool {
+        // La ventana nace con el foco mientras F7 sigue apretada: winit envía esa tecla
+        // como pulsación sintética, que no debe cerrarla al momento.
+        let WindowEvent::KeyboardInput { event, is_synthetic: false, .. } = event else { return false };
+        if event.state != ElementState::Pressed || event.repeat {
+            return false;
+        }
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::F7) => self.editor_open = false,
+            PhysicalKey::Code(KeyCode::KeyS) if self.ctrl => self.biome_editor.update(biome_editor::Message::Save),
+            _ => return false,
+        }
+        true
+    }
+
+    fn open_prefabs(&mut self) {
+        self.shown = Shown::Prefabs;
+        // La lista vive en el servidor: se pide cada vez que se abre el menú.
+        self.actions.push(Action::RefreshPrefabs);
+        self.focus(prefabs::NAME_INPUT);
+    }
+
+    /// Usa este ambiente desde ya (queda sin guardar hasta `save_environment`).
+    fn set_environment(&mut self, ctx: &mut Context, environment: Environment) {
+        self.environment = environment.sanitized();
+        self.environment_unsaved = true;
+        ctx.set_environment(self.environment.clone());
+    }
+
+    fn save_environment(&mut self) -> Result<(), String> {
+        let path = &self.config.environment_path;
+        environment::save(&self.environment, path)
+            .map_err(|error| format!("Could not save {}: {error:#}", path.display()))?;
+        self.environment_unsaved = false;
+        Ok(())
+    }
+
+    /// El ítem activo es la vara de selección.
+    fn wand_held(&self) -> bool {
+        self.hotbar
+            .active_item()
+            .and_then(|item| self.content.item(item))
+            .is_some_and(|item| item.tool.as_deref() == Some(builder::SELECTION_TOOL))
+    }
+
+    /// Resultado de algo de la herramienta de construcción: a la consola, al aviso del
+    /// HUD y al pie del menú de prefabs.
+    fn build_feedback(&mut self, text: String, ok: bool) {
+        self.console.print(if ok { Kind::Output } else { Kind::Error }, &text);
+        self.notice = Some((text.clone(), Instant::now() + NOTICE_TIME));
+        self.builder.set_status(text, ok);
+    }
+
+    /// Envía una orden de construcción, o explica por qué no se puede.
+    fn build(&mut self, ctx: &mut Context, op: Result<PrefabOp, String>) {
+        match op {
+            Ok(op) => ctx.prefab(op),
+            Err(problem) => self.build_feedback(problem, false),
+        }
+    }
+
     /// Cierra la pantalla que haya dentro del mundo y devuelve el control al jugador.
     fn resume(&mut self) {
         self.shown = Shown::None;
@@ -218,8 +372,12 @@ impl Tokikura {
     /// "Atrás" (Escape). Devuelve `false` si no hay a dónde volver.
     fn back(&mut self) -> bool {
         match self.shown {
+            // Colocando un prefab, Escape primero lo deja.
+            Shown::None if self.in_session && self.builder.pasting() => self.builder.stop_paste(),
             Shown::None if self.in_session => self.shown = Shown::Pause,
-            Shown::Pause | Shown::Inventory | Shown::Console => self.resume(),
+            Shown::Pause | Shown::Inventory | Shown::Console | Shown::Prefabs | Shown::Sky => {
+                self.resume()
+            }
             Shown::Settings => self.shown = self.settings_return,
             Shown::WorldCreate => self.open_world_select(""),
             Shown::WorldSelect => self.open_main_menu(""),
@@ -231,6 +389,11 @@ impl Tokikura {
     // --- Mundos ---
 
     fn play(&mut self, ctx: &mut Context, mode: SessionMode, seed: u32) {
+        self.world_dir = match &mode {
+            SessionMode::Host { world_dir, .. } => Some(world_dir.clone()),
+            _ => None,
+        };
+        self.world_seed = seed;
         ctx.start_session(SessionConfig {
             mode,
             player_name: self.settings.player_name.clone(),
@@ -243,6 +406,11 @@ impl Tokikura {
         self.content = Arc::default();
         self.icons = Arc::default();
         self.hotbar = Hotbar::default();
+        // La partida nueva empieza sin herramienta ni marcas, igual que su motor.
+        self.builder = Builder::default();
+        self.tool_sent = false;
+        self.overlay_sent = Overlay::default();
+        self.place_when_loaded = false;
         self.shown = Shown::None;
     }
 
@@ -260,6 +428,7 @@ impl Tokikura {
 
     /// Arranque, separado de `init` para poder probarlo sin dispositivo gráfico.
     fn start(&mut self, ctx: &mut Context) {
+        ctx.set_environment(self.environment.clone());
         match self.launch.take() {
             Some(Launch::Session(mode)) => self.play(ctx, mode, self.config.seed),
             _ => self.open_main_menu(""),
@@ -272,6 +441,9 @@ impl Tokikura {
             Some("pause") => self.shown = Shown::Pause,
             Some("inventory") => self.open_inventory(),
             Some("console") => self.open_console(),
+            Some("prefabs") => self.open_prefabs(),
+            Some("sky") => self.shown = Shown::Sky,
+            Some("biomes") => self.open_biome_editor(),
             Some("debug") => self.show_debug = true,
             Some(other) => log::warn!("KURAVOXEL_UI_OPEN: unknown screen '{other}'"),
             None => {}
@@ -328,7 +500,19 @@ impl Tokikura {
         let map = self.view == ViewKind::Map;
         // Inventario abierto sin estar escribiendo en su buscador.
         let inventory = self.shown == Shown::Inventory && !self.inventory.typing();
+        // Herramienta de construcción en uso: la vara en la mano o algo colocándose.
+        let pasting = playing && !map && self.builder.pasting();
+        let tool = playing && !map && (self.wand_held() || pasting);
         match key {
+            KeyCode::KeyC if tool && self.ctrl => self.actions.push(Action::Region(RegionAction::Copy)),
+            KeyCode::KeyX if tool && self.ctrl => self.actions.push(Action::Region(RegionAction::Cut)),
+            KeyCode::KeyV if tool && self.ctrl => self.actions.push(Action::TogglePaste),
+            KeyCode::KeyZ if tool && self.ctrl => self.actions.push(Action::Undo),
+            KeyCode::Delete if tool && !pasting => self.actions.push(Action::Region(RegionAction::Erase)),
+            KeyCode::KeyR if pasting => self.actions.push(Action::Rotate),
+            KeyCode::PageUp if pasting => self.actions.push(Action::Lift(1)),
+            KeyCode::PageDown if pasting => self.actions.push(Action::Lift(-1)),
+            KeyCode::KeyP if playing && !map => self.open_prefabs(),
             // La tecla a la izquierda del 1 ("º" en un teclado español) o F1.
             KeyCode::Backquote | KeyCode::F1 => match self.shown {
                 Shown::Console => self.resume(),
@@ -340,6 +524,10 @@ impl Tokikura {
             KeyCode::KeyE if playing && !map => self.open_inventory(),
             KeyCode::KeyE if inventory => self.resume(),
             KeyCode::F3 if playing => self.show_debug = !self.show_debug,
+            KeyCode::F6 if playing => self.shown = Shown::Sky,
+            KeyCode::F6 if self.shown == Shown::Sky => self.resume(),
+            KeyCode::F7 if playing && self.editor_open => self.editor_open = false,
+            KeyCode::F7 if playing => self.open_biome_editor(),
             KeyCode::KeyQ if playing && !map => self.actions.push(Action::DropActive),
             _ if (playing && !map) || inventory => match digit(key) {
                 Some(slot) => self.hotbar.select(slot),
@@ -353,7 +541,9 @@ impl Tokikura {
     /// Entrada que el juego se queda antes de que la vean las pantallas o la partida.
     fn shortcut(&mut self, event: &WindowEvent) -> bool {
         match event {
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            // Al recibir el foco, winit inventa pulsaciones de las teclas que siguen
+            // apretadas (`is_synthetic`): no son atajos (F7 abriría y cerraría el editor).
+            WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if event.state == ElementState::Pressed => {
                 match event.physical_key {
                     PhysicalKey::Code(key) => self.key_pressed(key, event.repeat),
                     PhysicalKey::Unidentified(_) => false,
@@ -361,6 +551,7 @@ impl Tokikura {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.alt = modifiers.state().alt_key();
+                self.ctrl = modifiers.state().control_key();
                 false
             }
             WindowEvent::MouseWheel { delta, .. } if self.in_session && self.shown == Shown::None => {
@@ -384,6 +575,8 @@ impl Tokikura {
         let step = if lines > 0.0 { -1 } else { 1 };
         if self.alt || self.view == ViewKind::Map {
             self.actions.push(Action::Zoom(step));
+        } else if self.builder.nudge(-step) {
+            // Apuntando a una cara de la selección, la rueda la empuja o tira de ella.
         } else {
             self.hotbar.scroll(step);
         }
@@ -414,6 +607,16 @@ impl Tokikura {
                         ctx.drop_item(item);
                     }
                 }
+                Action::Region(action) => {
+                    let op = self.builder.region_op(action);
+                    self.build(ctx, op);
+                }
+                Action::Undo => ctx.prefab(PrefabOp::Undo),
+                Action::TogglePaste if self.builder.pasting() => self.builder.stop_paste(),
+                Action::TogglePaste => self.builder.start_paste(),
+                Action::Rotate => self.builder.rotate(&self.content),
+                Action::Lift(blocks) => self.builder.lift(blocks),
+                Action::RefreshPrefabs => ctx.prefab(PrefabOp::List),
             }
         }
     }
@@ -574,6 +777,91 @@ impl Tokikura {
                     Err(problem) => self.console.print(Kind::Error, &problem),
                 }
             }
+            Command::Sky if ctx.in_session() => self.shown = Shown::Sky,
+            Command::Sky => self.console.print(Kind::Error, "Not in a world."),
+            Command::Env(None) => print(&mut self.console, &environment::describe(&self.environment)),
+            Command::Env(Some((key, value))) => {
+                let mut changed = self.environment.clone();
+                match environment::set(&mut changed, &key, &value) {
+                    Ok(()) => {
+                        self.set_environment(ctx, changed);
+                        let shown = environment::describe(&self.environment);
+                        let line = shown.iter().find(|line| line.starts_with(&format!("{key} =")));
+                        self.console.print(Kind::Output, line.map_or("Done.", String::as_str));
+                    }
+                    Err(problem) => self.console.print(Kind::Error, &problem),
+                }
+            }
+            Command::EnvReset => {
+                self.set_environment(ctx, Environment::default());
+                self.console.print(Kind::Output, "Sky and light back to their defaults (not saved yet).");
+            }
+            Command::EnvSave => match self.save_environment() {
+                Ok(()) => self.console.print(
+                    Kind::Output,
+                    &format!("Saved to {}.", self.config.environment_path.display()),
+                ),
+                Err(problem) => self.console.print(Kind::Error, &problem),
+            },
+            Command::Corner(..)
+            | Command::Deselect
+            | Command::Region(_)
+            | Command::Paste { .. }
+            | Command::Rotate
+            | Command::PasteAir(_)
+            | Command::Undo
+            | Command::PrefabSave(_)
+            | Command::PrefabLoad(_)
+            | Command::PrefabDelete(_)
+            | Command::PrefabList
+            | Command::Prefabs
+                if !ctx.in_session() =>
+            {
+                self.console.print(Kind::Error, "Not in a world.")
+            }
+            Command::Corner(first, pos) => {
+                let feet = ctx.session.as_ref().map_or([0; 3], |info| feet_voxel(info.position));
+                self.builder.set_corner(first, IVec3::from_array(pos.unwrap_or(feet)));
+                self.console.print(Kind::Output, &self.builder.selection_text());
+            }
+            Command::Deselect => {
+                self.builder.deselect();
+                self.console.print(Kind::Output, "Selection cleared.");
+            }
+            Command::Region(action) => {
+                let op = self.builder.region_op(action);
+                self.build(ctx, op);
+            }
+            Command::Paste { here: false } => {
+                self.builder.start_paste();
+                self.console.print(Kind::Output, "Placing: aim and right click (left click or Esc to stop).");
+            }
+            Command::Paste { here: true } => {
+                let info = ctx.session.as_ref();
+                let before = info.and_then(|info| info.target_before.or(Some(feet_voxel(info.position))));
+                ctx.prefab(self.builder.paste_at(before.unwrap_or_default()));
+            }
+            Command::Rotate => {
+                self.builder.rotate(&self.content);
+                self.console.print(Kind::Output, &self.builder.clipboard_text());
+            }
+            Command::PasteAir(on) => {
+                self.builder.paste_air = on.unwrap_or(self.builder.paste_air);
+                let state = if self.builder.paste_air { "on" } else { "off" };
+                self.console.print(Kind::Output, &format!("pasteair = {state}"));
+            }
+            Command::Undo => ctx.prefab(PrefabOp::Undo),
+            Command::PrefabSave(name) => {
+                let op = self.builder.save_op(&name);
+                self.build(ctx, op);
+            }
+            Command::PrefabLoad(name) => ctx.prefab(PrefabOp::Load { name }),
+            Command::PrefabDelete(name) => ctx.prefab(PrefabOp::Delete { name }),
+            Command::PrefabList => {
+                self.list_to_console = true;
+                ctx.prefab(PrefabOp::List);
+            }
+            Command::Prefabs => self.open_prefabs(),
             Command::Menu if ctx.in_session() => self.leave_world(ctx),
             Command::Menu => self.console.print(Kind::Error, "Not in a world."),
             Command::Quit => ctx.exit(),
@@ -620,6 +908,10 @@ impl Tokikura {
             match request {
                 pause_menu::Request::Resume => self.resume(),
                 pause_menu::Request::Settings => self.open_settings(),
+                pause_menu::Request::BiomeEditor => {
+                    self.resume();
+                    self.open_biome_editor();
+                }
                 pause_menu::Request::Leave => self.leave_world(ctx),
                 pause_menu::Request::Quit => ctx.exit(),
             }
@@ -631,10 +923,63 @@ impl Tokikura {
                 inventory::Request::Close => self.resume(),
             }
         }
+        for request in self.prefabs_screen.take_requests() {
+            match request {
+                prefabs::Request::Save(name) => {
+                    let op = self.builder.save_op(&name);
+                    self.build(ctx, op);
+                }
+                prefabs::Request::Load(name) => {
+                    // Se cierra el menú y, en cuanto llegue, se empieza a colocar.
+                    self.place_when_loaded = true;
+                    ctx.prefab(PrefabOp::Load { name });
+                    self.resume();
+                }
+                prefabs::Request::Delete(name) => ctx.prefab(PrefabOp::Delete { name }),
+                prefabs::Request::Region(action) => {
+                    let op = self.builder.region_op(action);
+                    self.build(ctx, op);
+                }
+                prefabs::Request::Deselect => self.builder.deselect(),
+                prefabs::Request::Undo => ctx.prefab(PrefabOp::Undo),
+                prefabs::Request::Place => {
+                    self.builder.start_paste();
+                    self.resume();
+                }
+                prefabs::Request::PasteAir(on) => self.builder.paste_air = on,
+                prefabs::Request::Close => self.resume(),
+            }
+        }
+        for request in self.sky_screen.take_requests() {
+            match request {
+                sky::Request::SetTime(hours) => ctx.set_time(Some(hours), None),
+                sky::Request::SetDayLength(seconds) => ctx.set_time(None, Some(seconds)),
+                sky::Request::Apply(environment) => self.set_environment(ctx, environment),
+                sky::Request::Save => {
+                    if let Err(problem) = self.save_environment() {
+                        self.console.print(Kind::Error, &problem);
+                        log::error!("{problem}");
+                    }
+                }
+                sky::Request::Close => self.resume(),
+            }
+        }
+        for request in self.biome_editor.take_requests() {
+            match request {
+                biome_editor::Request::Close => self.editor_open = false,
+                biome_editor::Request::Teleport([x, y, z]) => ctx.server_command(&format!("tp {x:.1} {y:.1} {z:.1}")),
+                biome_editor::Request::Terrain(op) => ctx.terrain(op),
+            }
+        }
         for console::Request::Run(line) in self.console.take_requests() {
             self.run_console_line(ctx, &line);
         }
     }
+}
+
+/// Voxel en el que tiene los pies un jugador cuyos ojos están en `eye`.
+fn feet_voxel([x, y, z]: [f64; 3]) -> [i32; 3] {
+    [x.floor() as i32, (y - EYE_HEIGHT).floor() as i32, z.floor() as i32]
 }
 
 /// Carpeta (relativa al directorio de trabajo) donde `icons` escribe los iconos.
@@ -719,6 +1064,48 @@ impl Game for Tokikura {
                 SessionEvent::CommandOutput { text, ok } => {
                     self.console.print(if ok { Kind::Output } else { Kind::Error }, &text)
                 }
+                SessionEvent::ToolClick { button, hit, before } => {
+                    match self.builder.click(button, hit, before) {
+                        Ok(Some(op)) => ctx.prefab(op),
+                        Ok(None) => {}
+                        Err(problem) => self.build_feedback(problem, false),
+                    }
+                }
+                SessionEvent::ToolRelease { button } => {
+                    if button == kuravoxel_client::session::ToolButton::Primary {
+                        self.builder.release();
+                    }
+                }
+                SessionEvent::PrefabResult { text, ok } => {
+                    // Si falló la carga pedida desde el menú, ya no hay nada que colocar.
+                    self.place_when_loaded &= ok;
+                    // Pedir la lista no dice nada: la respuesta es la propia lista.
+                    if !text.is_empty() {
+                        self.build_feedback(text, ok);
+                    }
+                }
+                SessionEvent::Clipboard { prefab, name } => {
+                    self.builder.set_clipboard(prefab, name);
+                    if std::mem::take(&mut self.place_when_loaded) {
+                        self.builder.start_paste();
+                    }
+                }
+                SessionEvent::TerrainStatus(status) => {
+                    self.biome_editor.set_terrain_status(&status);
+                    self.terrain_status = status;
+                }
+                SessionEvent::PrefabList(list) => {
+                    if std::mem::take(&mut self.list_to_console) {
+                        if list.is_empty() {
+                            self.console.print(Kind::Output, "No prefabs saved yet.");
+                        }
+                        for prefab in &list {
+                            let [x, y, z] = prefab.size;
+                            self.console.print(Kind::Output, &format!("{}  {x}x{y}x{z}", prefab.id));
+                        }
+                    }
+                    self.builder.set_prefabs(list);
+                }
             }
         }
         if let Some(info) = &ctx.session {
@@ -733,6 +1120,8 @@ impl Game for Tokikura {
                 self.content = info.content.clone();
                 self.icons = Arc::new(Icons::new(&self.content));
                 self.hotbar.sync(&self.content);
+                // Los bloques girados de la vista previa dependen del contenido.
+                self.builder.refresh(&self.content);
             }
         }
 
@@ -756,9 +1145,72 @@ impl Game for Tokikura {
             self.hud.notice = self.notice.as_ref().map(|(text, _)| text.clone());
             self.hud.sync(info, &self.icons, &self.hotbar, self.mode.name(), self.show_debug);
             self.inventory.sync(&self.content, &self.icons, &self.hotbar);
+            // Herramienta de construcción: con la vara en la mano o colocando algo, los
+            // clics son suyos, y sus marcas se ven sobre el mundo.
+            let map = info.view == ViewKind::Map;
+            let wand = self.wand_held();
+            let tool = !map && (wand || self.builder.pasting());
+            let show_selection = wand || self.builder.pasting() || self.shown == Shown::Prefabs;
+            // Con la vara en uso, la mira puede agarrar las caras de la selección.
+            if wand && !map && self.shown == Shown::None {
+                self.builder.aim(info.aim_origin, info.aim_dir, info.target, self.ctrl);
+            } else {
+                self.builder.clear_aim();
+            }
+            let overlay = if map {
+                Overlay::default()
+            } else {
+                self.builder.overlay(info.target_before, show_selection)
+            };
+            self.hud.tool =
+                if tool && self.shown == Shown::None { self.builder.hud_lines() } else { Vec::new() };
+            // Medidas de la selección, sobre sus aristas.
+            self.hud.labels = if show_selection && !map && self.shown == Shown::None {
+                let labels = self.builder.labels(info.camera).into_iter();
+                labels.filter_map(|(point, text)| Some((info.project(point)?, text))).collect()
+            } else {
+                Vec::new()
+            };
+            self.prefabs_screen.sync(&self.builder, info.hosting);
+            self.sky_screen.sync(info.time, &self.environment, info.hosting, self.environment_unsaved);
+            self.biome_editor.sync(&info.content, info.position, info.hosting);
+            if self.editor_open {
+                self.biome_editor.tick(Instant::now());
+            }
+            // Las vistas previas siguen llegando aunque se cierre el editor.
+            if let Some(previews) = self.previews.as_ref() {
+                if let Some(job) = self.biome_editor.take_job() {
+                    previews.request(job);
+                }
+                if let Some(done) = previews.poll() {
+                    self.biome_editor.preview_done(done);
+                }
+            }
+
             let block = self.hotbar.active_block(&self.content);
             if info.selected != block {
                 ctx.select_block(block);
+            }
+            if tool != self.tool_sent {
+                self.tool_sent = tool;
+                ctx.set_tool(tool.then_some(builder::TOOL_REACH));
+            }
+            if overlay != self.overlay_sent {
+                self.overlay_sent = overlay.clone();
+                ctx.set_overlay(overlay);
+            }
+        }
+        // La ventana del editor de biomas vive lo que la partida.
+        if !self.in_session {
+            self.editor_open = false;
+            self.terrain_status = TerrainStatus::default();
+        }
+        if self.editor_open != self.editor_window_sent {
+            self.editor_window_sent = self.editor_open;
+            if self.editor_open {
+                ctx.open_window(EDITOR_WINDOW, WindowSpec { title: "Tokikura - Biome editor".into(), size: EDITOR_SIZE });
+            } else {
+                ctx.close_window(EDITOR_WINDOW);
             }
         }
         if self.grab_requested && ctx.in_session() && self.in_session {
@@ -783,6 +1235,14 @@ impl Game for Tokikura {
         self.shown != Shown::None
     }
 
+    /// En pausa y en los menús no se juega: el motor dibuja menos frames.
+    fn idle(&self) -> bool {
+        matches!(
+            self.shown,
+            Shown::Pause | Shown::MainMenu | Shown::WorldSelect | Shown::WorldCreate | Shown::Settings
+        )
+    }
+
     fn draw_overlay(&mut self, view: &wgpu::TextureView, _target: OverlayTarget) {
         let Some(ui) = self.ui.as_mut() else { return };
         // Dentro de un mundo el HUD va siempre debajo, sin entrada. En la vista de mapa
@@ -800,6 +1260,47 @@ impl Game for Tokikura {
             Shown::Pause => ui.frame(&mut self.pause_menu, view),
             Shown::Inventory => ui.frame(&mut self.inventory, view),
             Shown::Console => ui.frame(&mut self.console, view),
+            Shown::Prefabs => ui.frame(&mut self.prefabs_screen, view),
+            Shown::Sky => ui.frame(&mut self.sky_screen, view),
+        }
+    }
+
+    fn window_opened(&mut self, key: WindowKey, host: &Host) {
+        if key == EDITOR_WINDOW {
+            let mut ui = IcedLayer::new(host);
+            ui.set_scale(self.settings.ui_scale);
+            self.editor_ui = Some(ui);
+        }
+    }
+
+    fn extra_window_event(&mut self, key: WindowKey, event: &WindowEvent) {
+        if key != EDITOR_WINDOW {
+            return;
+        }
+        if let WindowEvent::ModifiersChanged(modifiers) = event {
+            self.ctrl = modifiers.state().control_key();
+        }
+        if self.editor_shortcut(event) {
+            return;
+        }
+        if let Some(ui) = self.editor_ui.as_mut() {
+            ui.window_event(event);
+        }
+    }
+
+    fn draw_window(&mut self, key: WindowKey, view: &wgpu::TextureView, _target: OverlayTarget) {
+        if key == EDITOR_WINDOW {
+            if let Some(ui) = self.editor_ui.as_mut() {
+                ui.frame(&mut self.biome_editor, view);
+            }
+        }
+    }
+
+    fn window_closed(&mut self, key: WindowKey) {
+        if key == EDITOR_WINDOW {
+            self.editor_ui = None;
+            self.editor_open = false;
+            self.editor_window_sent = false;
         }
     }
 }
@@ -829,6 +1330,7 @@ mod tests {
                 worlds_dir: dir.clone(),
                 content_dir: "content".into(),
                 settings_path: dir.join("settings.toml"),
+                environment_path: dir.join("environment.toml"),
                 seed: 7,
                 dev_open: None,
                 dev_console: Vec::new(),
@@ -882,6 +1384,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn f7_opens_the_biome_editor_in_its_own_window() {
+        let (mut fixture, info) = Fixture::in_world("biomes");
+        let opens = |commands: &[EngineCommand]| {
+            commands.iter().any(|c| matches!(c, EngineCommand::OpenWindow(EDITOR_WINDOW, _)))
+        };
+        let closes = |commands: &[EngineCommand]| {
+            commands.iter().any(|c| matches!(c, EngineCommand::CloseWindow(EDITOR_WINDOW)))
+        };
+        assert!(fixture.game.key_pressed(KeyCode::F7, false));
+        assert!(opens(&fixture.frame(&info)));
+        // La ventana del juego se sigue jugando: el editor no se queda la entrada.
+        assert_eq!(fixture.game.shown, Shown::None);
+        assert!(!fixture.game.wants_input());
+        assert!(fixture.game.previews.is_some(), "the preview thread starts with the editor");
+        assert!(!opens(&fixture.frame(&info)), "it is asked only once");
+
+        // F7 (en cualquiera de las dos ventanas) o su botón la cierran.
+        assert!(fixture.game.key_pressed(KeyCode::F7, false));
+        assert!(closes(&fixture.frame(&info)));
+        fixture.game.window_closed(EDITOR_WINDOW);
+        fixture.game.key_pressed(KeyCode::F7, false);
+        assert!(opens(&fixture.frame(&info)));
+        fixture.game.biome_editor.update(biome_editor::Message::Close);
+        assert!(closes(&fixture.frame(&info)));
+
+        // Cerrarla con la X de la ventana: el motor avisa y se puede volver a abrir.
+        fixture.game.key_pressed(KeyCode::F7, false);
+        fixture.frame(&info);
+        fixture.game.window_closed(EDITOR_WINDOW);
+        assert!(!fixture.game.editor_open);
+        fixture.game.key_pressed(KeyCode::F7, false);
+        assert!(opens(&fixture.frame(&info)));
+
+        // Las órdenes de terreno del editor van al servidor de la partida.
+        fixture.game.biome_editor.update(biome_editor::Message::LiveWorld(false));
+        let commands = fixture.frame(&info);
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            EngineCommand::Terrain(kuravoxel_common::protocol::TerrainOp::Auto(false))
+        )));
+
+        // También desde el menú de pausa, que se cierra para dejar jugar.
+        fixture.game.key_pressed(KeyCode::F7, false);
+        assert!(closes(&fixture.frame(&info)));
+        fixture.game.window_closed(EDITOR_WINDOW);
+        fixture.game.shown = Shown::Pause;
+        fixture.game.pause_menu.update(pause_menu::Message::BiomeEditor);
+        assert!(opens(&fixture.frame(&info)));
+        assert_eq!(fixture.game.shown, Shown::None);
+
+        // Al salir del mundo, la ventana se cierra.
+        let mut ctx = Context::new(None);
+        fixture.game.update(&mut ctx);
+        assert!(closes(&ctx.take_commands()));
+    }
+
+    #[test]
+    fn the_sky_panel_changes_time_and_light_and_saves_them() {
+        let (mut fixture, info) = Fixture::in_world("sky");
+        assert!(fixture.game.key_pressed(KeyCode::F6, false));
+        assert_eq!(fixture.game.shown, Shown::Sky);
+        assert!(fixture.game.wants_input());
+
+        // La hora va al servidor; el ambiente, al renderer.
+        fixture.game.sky_screen.update(sky::Message::Time(18.0));
+        fixture.game.sky_screen.update(sky::Message::Paused(true));
+        fixture.game.sky_screen.update(sky::Message::Scalar(environment::Scalar::SunTilt, 50.0));
+        let commands = fixture.frame(&info);
+        assert!(matches!(
+            commands[..],
+            [
+                EngineCommand::SetTime { hours: Some(18.0), day_length: None },
+                EngineCommand::SetTime { hours: None, day_length: Some(0.0) },
+                EngineCommand::SetEnvironment(ref applied),
+            ] if applied.sun_tilt == 50.0
+        ));
+        assert!(fixture.game.environment_unsaved);
+
+        fixture.game.sky_screen.update(sky::Message::Save);
+        fixture.frame(&info);
+        assert!(!fixture.game.environment_unsaved);
+        assert_eq!(environment::load(&fixture.dir.join("environment.toml")).sun_tilt, 50.0);
+
+        // La consola cambia los mismos valores.
+        let commands = fixture.console(&info, "env shadow_softness 0.2");
+        assert!(matches!(&commands[..], [EngineCommand::SetEnvironment(e)] if e.shadow_softness == 0.2));
+        assert_eq!(fixture.last_line(), (Kind::Output, "shadow_softness = 0.20".into()));
+        fixture.console(&info, "env night.zenith purple");
+        assert_eq!(fixture.last_line().0, Kind::Error);
+        let commands = fixture.console(&info, "env reset");
+        assert!(matches!(&commands[..], [EngineCommand::SetEnvironment(e)] if *e == Environment::default()));
+        let commands = fixture.console(&info, "time set noon");
+        assert!(matches!(&commands[..], [EngineCommand::ServerCommand(line)] if line == "time set noon"));
+
+        // F6 y Escape lo cierran.
+        assert!(fixture.game.key_pressed(KeyCode::F6, false));
+        assert_eq!(fixture.game.shown, Shown::None);
+        fixture.console(&info, "sky");
+        assert_eq!(fixture.game.shown, Shown::Sky);
+        assert!(fixture.game.key_pressed(KeyCode::Escape, false));
+        assert_eq!(fixture.game.shown, Shown::None);
+    }
+
     fn started_world(commands: &[EngineCommand]) -> Option<(PathBuf, u32)> {
         commands.iter().find_map(|command| match command {
             EngineCommand::StartSession(config) => match &config.mode {
@@ -898,7 +1504,8 @@ mod tests {
         let game = &mut fixture.game;
         let mut ctx = Context::new(None);
         game.start(&mut ctx);
-        assert!(ctx.take_commands().is_empty());
+        // Lo único que se le pide al motor al arrancar es el ambiente guardado.
+        assert!(matches!(ctx.take_commands()[..], [EngineCommand::SetEnvironment(_)]));
         assert_eq!(game.shown, Shown::MainMenu);
 
         game.main_menu.update(main_menu::Message::Play);
@@ -1243,5 +1850,140 @@ mod tests {
         assert!(matches!(commands[..], [EngineCommand::Configure(client)] if !client.vsync));
         assert_eq!(fixture.game.shown, Shown::Pause);
         assert!(!fixture.game.settings.vsync);
+    }
+
+    /// Contenido con dos bloques y la vara de selección (ítem 2).
+    fn content_with_wand() -> ContentData {
+        use kuravoxel_common::content::{BlockDef, ItemSource, Loaded};
+        let blocks = vec![
+            BlockDef::simple("base:dirt", "dirt", [90, 60, 30]),
+            BlockDef::simple("base:stone", "stone", [120, 120, 120]),
+        ];
+        let wand = ItemSource {
+            id: "base:wand".into(),
+            name: Some("Wand".into()),
+            color: Some([200, 50, 200]),
+            category: None,
+            tags: None,
+            block: None,
+            tool: Some("selection".into()),
+            model: None,
+            max_stack: None,
+            icon: None,
+        };
+        ContentData::assign(Loaded { blocks, items: vec![wand], ..Loaded::default() }, &[], &[]).unwrap()
+    }
+
+    #[test]
+    fn the_wand_selects_copies_and_places_prefabs() {
+        use kuravoxel_client::session::ToolButton;
+        use kuravoxel_common::prefab::{Prefab, PrefabInfo};
+
+        let mut fixture = Fixture::new("builder");
+        fixture.game.shown = Shown::None;
+        let content = Arc::new(content_with_wand());
+        let mut info = SessionInfo { content: content.clone(), hosting: true, loaded: true, ..SessionInfo::default() };
+        fixture.frame(&info);
+        info.selected = Block(1);
+        assert!(fixture.frame(&info).is_empty(), "no tool, no marks: nothing to tell the engine");
+
+        // Con la vara en la mano el motor deja de editar y avisa de los clics.
+        let commands = fixture.console(&info, "give wand");
+        assert!(commands.iter().any(|c| matches!(c, EngineCommand::SetTool(Some(reach)) if *reach == builder::TOOL_REACH)));
+        info.selected = Block::AIR;
+        assert!(fixture.game.hud.tool[0].starts_with("Selection wand"), "the HUD explains the tool");
+
+        let mut ctx = Context::new(Some(info.clone()));
+        // Clic en A, soltar, clic en B y un tercero que confirma la altura.
+        let click = |hit| SessionEvent::ToolClick { button: ToolButton::Primary, hit, before: None };
+        ctx.session_events.push(click(Some([1, 2, 3])));
+        ctx.session_events.push(SessionEvent::ToolRelease { button: ToolButton::Primary });
+        ctx.session_events.push(click(Some([4, 5, 6])));
+        ctx.session_events.push(click(None));
+        fixture.game.update(&mut ctx);
+        let marks = ctx.take_commands().into_iter().find_map(|command| match command {
+            EngineCommand::SetOverlay(overlay) => Some(overlay),
+            _ => None,
+        });
+        assert_eq!(marks.map(|overlay| overlay.outlines.len()), Some(9), "the box, its six handles and its two corners");
+        assert!(fixture.game.hud.tool[0].contains("4x4x4 (64 blocks)"));
+
+        // Ctrl+C copia la selección; sin Ctrl, C no es nada.
+        assert!(!fixture.game.key_pressed(KeyCode::KeyC, false));
+        fixture.game.ctrl = true;
+        assert!(fixture.game.key_pressed(KeyCode::KeyC, false));
+        let commands = fixture.frame(&info);
+        assert!(matches!(
+            commands[..],
+            [EngineCommand::Prefab(PrefabOp::Copy { min: [1, 2, 3], max: [4, 5, 6] })]
+        ));
+
+        // El portapapeles llega del servidor; Ctrl+V lo pone bajo la mira.
+        let prefab = Arc::new(Prefab::capture(IVec3::new(3, 2, 3), &content, |_| Block(1)));
+        let mut ctx = Context::new(Some(info.clone()));
+        ctx.session_events.push(SessionEvent::Clipboard { prefab, name: String::new() });
+        ctx.session_events.push(SessionEvent::PrefabResult { text: "Copied 3x2x3, 18 blocks.".into(), ok: true });
+        fixture.game.update(&mut ctx);
+        assert_eq!(fixture.game.hud.notice.as_deref(), Some("Copied 3x2x3, 18 blocks."));
+        assert!(fixture.game.key_pressed(KeyCode::KeyV, false));
+        fixture.game.ctrl = false;
+        info.target_before = Some([10, 20, 30]);
+        let commands = fixture.frame(&info);
+        let ghost = commands.into_iter().find_map(|command| match command {
+            EngineCommand::SetOverlay(overlay) => overlay.ghost,
+            _ => None,
+        });
+        assert_eq!(ghost.map(|ghost| ghost.origin), Some([9, 20, 29]));
+
+        // R gira, el clic derecho pega y Escape deja de colocar sin abrir la pausa.
+        assert!(fixture.game.key_pressed(KeyCode::KeyR, false));
+        assert!(fixture.game.key_pressed(KeyCode::PageUp, false));
+        fixture.frame(&info);
+        let mut ctx = Context::new(Some(info.clone()));
+        ctx.session_events.push(SessionEvent::ToolClick {
+            button: ToolButton::Secondary,
+            hit: Some([10, 19, 30]),
+            before: Some([10, 20, 30]),
+        });
+        fixture.game.update(&mut ctx);
+        assert!(ctx.take_commands().iter().any(|command| matches!(
+            command,
+            EngineCommand::Prefab(PrefabOp::Paste { pos: [10, 21, 30], turns: 1, air: false })
+        )));
+        assert!(fixture.game.key_pressed(KeyCode::Escape, false));
+        assert_eq!((fixture.game.shown, fixture.game.builder.pasting()), (Shown::None, false));
+
+        // P abre el menú y pide la lista; cargar desde él cierra el menú y empieza a colocar.
+        assert!(fixture.game.key_pressed(KeyCode::KeyP, false));
+        assert_eq!(fixture.game.shown, Shown::Prefabs);
+        assert!(!fixture.game.key_pressed(KeyCode::KeyP, false), "letters are text for the name box");
+        let commands = fixture.frame(&info);
+        assert!(commands.iter().any(|c| matches!(c, EngineCommand::Prefab(PrefabOp::List))));
+        let mut ctx = Context::new(Some(info.clone()));
+        ctx.session_events
+            .push(SessionEvent::PrefabList(vec![PrefabInfo { id: "base:trees/oak".into(), size: [5, 8, 5] }]));
+        fixture.game.update(&mut ctx);
+        fixture.game.prefabs_screen.update(prefabs::Message::Select("base:trees/oak".into()));
+        fixture.game.prefabs_screen.update(prefabs::Message::Load);
+        let commands = fixture.frame(&info);
+        assert!(commands.iter().any(
+            |c| matches!(c, EngineCommand::Prefab(PrefabOp::Load { name }) if name == "base:trees/oak")
+        ));
+        assert_eq!(fixture.game.shown, Shown::None);
+        let prefab = Arc::new(Prefab::capture(IVec3::ONE, &content, |_| Block(2)));
+        let mut ctx = Context::new(Some(info.clone()));
+        ctx.session_events.push(SessionEvent::Clipboard { prefab, name: "base:trees/oak".into() });
+        fixture.game.update(&mut ctx);
+        assert!(fixture.game.builder.pasting());
+
+        // Y desde la consola.
+        let commands = fixture.console(&info, "prefab save trees/pine");
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            EngineCommand::Prefab(PrefabOp::Save { name, min: [1, 2, 3], max: [4, 5, 6] }) if name == "trees/pine"
+        )));
+        fixture.console(&info, "desel");
+        fixture.console(&info, "copy");
+        assert_eq!(fixture.last_line().0, Kind::Error);
     }
 }

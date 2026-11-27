@@ -1,9 +1,9 @@
 name = "Horno"
-color = "#6F6A66"
+color = "#5F4B40"
 category = "Construcción"
 # Mira hacia quien lo coloca (facing=north|east|south|west).
 orientation = "horizontal"
-
-[faces]
-front = "#E2723B"
-top = "#58534F"
+# Modelo de mini-voxeles hecho en MagicaVoxel (models/furnace.vox).
+model = "base:furnace"
+# La boca del horno está dibujada en el lado −Y de MagicaVoxel (el sur).
+model_front = "south"

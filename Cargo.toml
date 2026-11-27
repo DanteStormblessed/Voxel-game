@@ -24,7 +24,7 @@ wgpu = "27"
 winit = "0.30"
 iced_wgpu = "0.14"
 iced_winit = "0.14"
-iced_widget = { version = "0.14", features = ["wgpu", "image"] }
+iced_widget = { version = "0.14", features = ["wgpu", "image", "canvas"] }
 iced_runtime = "0.14"
 glam = "0.30"
 rayon = "1"
@@ -39,7 +39,8 @@ quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 bytes = "1"
-toml = "0.8"
+toml = { version = "0.8", features = ["preserve_order"] }
+toml_edit = "0.22"
 
 # Debug usable: nuestro código con optimización ligera, dependencias a tope.
 [profile.dev]

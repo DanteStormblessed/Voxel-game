@@ -1,5 +1,5 @@
-# Ítem sin bloque: una herramienta del motor. Reservado para las herramientas
-# creativas (fase 3d); por ahora no hace nada al usarlo.
+# Ítem sin bloque: la herramienta de selección. Con ella en la mano, clic izquierdo y
+# derecho marcan las dos esquinas de una caja para copiarla o guardarla como prefab.
 name = "Vara de selección"
 color = "#E04CE0"
 category = "Herramientas"

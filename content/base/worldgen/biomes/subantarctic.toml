@@ -1,0 +1,77 @@
+# Pre-antártico: estepa barrida por el viento, canales de mar y un campo de hielo que
+# cubre la cordillera.
+name = "Pre-Antártico"
+color = "#E8FAFF"
+
+[nodes]
+steppe_noise = { type = "noise", scale = 650, octaves = 3 }
+steppe_part = { type = "mul", inputs = ["steppe_noise", 14] }
+rough = { type = "mul", inputs = ["hills", 4] }
+coast_range = { type = "mul", inputs = ["coastal", 35] }
+steppe = { type = "add", inputs = [18, "steppe_part", "rough", "coast_range"] }
+
+# Canales: brazos de mar anchos que parten la estepa.
+strait_noise = { type = "noise", scale = [3000, 900], octaves = 2, warp = 200 }
+strait_line = { type = "abs", input = "strait_noise" }
+strait_raw = { type = "smoothstep", input = "strait_line", from = 0.09, to = 0.02 }
+strait_reach = { type = "smoothstep", input = "across", from = 0.66, to = 0.5 }
+strait = { type = "mul", inputs = ["strait_reach", "strait_raw"] }
+carved = { type = "mix", a = "steppe", b = -22, t = "strait" }
+
+islands = { type = "noise", scale = 500, octaves = 3 }
+islands_part = { type = "mul", inputs = ["islands", 0.06] }
+coastline = { type = "add", inputs = ["across", "islands_part"] }
+shore = { type = "smoothstep", input = "coastline", from = 0.08, to = 0.16 }
+lowland = { type = "mix", a = "seafloor", b = "carved", t = "shore" }
+
+# Campo de hielo: rellena la cordillera, más baja y redondeada que al norte.
+icefield = { type = "smoothstep", input = "coastline", from = 0.52, to = 0.74 }
+ice_fill = { type = "mul", inputs = ["icefield", 70] }
+andes = { type = "mul", inputs = ["cordillera", 0.7] }
+height = { type = "add", inputs = ["lowland", "andes", "ice_fill"] }
+
+# Bosquetes de lenga en manchas.
+grove = { type = "noise", scale = 260, octaves = 2 }
+grove_mask = { type = "smoothstep", input = "grove", from = 0.15, to = 0.5 }
+lenga = { type = "mul", inputs = ["grove_mask", 0.3] }
+
+[[surface]]
+below = 2
+top = "base:gravel"
+
+[[surface]]
+steeper = 1.95
+top = "base:stone"
+
+# Glaciar: hielo en las partes llanas del campo de hielo.
+[[surface]]
+node = "icefield"
+node_above = 0.45
+above = 60
+flatter = 0.8
+top = "base:ice"
+depth = 6
+
+[[surface]]
+above = 75
+jitter = 14
+top = "base:snow"
+under = "base:stone"
+
+[[surface]]
+top = "base:tundra"
+under = "base:dirt"
+
+[[trees]]
+density = "lenga"
+wood = "base:wood"
+leaves = ["base:leaves_orange", "base:leaves_orange", "base:leaves_yellow"]
+trunk = [2, 4]
+on = ["base:tundra"]
+
+[[trees]]
+density = 0.03
+shape = "bush"
+wood = "base:wood"
+leaves = ["base:leaves_orange"]
+on = ["base:tundra"]

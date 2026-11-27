@@ -9,4 +9,5 @@ pub mod model;
 pub mod shape;
 pub mod net;
 pub mod physics;
+pub mod prefab;
 pub mod protocol;

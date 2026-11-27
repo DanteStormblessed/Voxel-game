@@ -3,6 +3,8 @@
 //! Aquí solo se interpreta el texto; `game.rs` los ejecuta. Lo que no es un comando del
 //! cliente se envía tal cual al servidor (`tp`, `seed`...), que tiene los suyos.
 
+use crate::builder::RegionAction;
+
 /// Ayuda de los comandos del cliente, una línea por comando.
 pub const HELP: &[&str] = &[
     "help            show this list",
@@ -18,7 +20,20 @@ pub const HELP: &[&str] = &[
     "icons           export every item icon as PNG (to retouch and reuse)",
     "mode [name]     show or change the game mode (survival, creative, spectator)",
     "zoom <meters>   camera distance: 0 first person, up to 32 third person, more = map",
-    "set [key value] show or change a setting (fov, view, far, ...)",
+    "set [key value] show or change a setting (fov, view, far, shadows, ...)",
+    "sky             open the sky and light panel (also F6)",
+    "env [key value] show or change the sky, sun and shadow values (env reset, env save)",
+    "time ...        time of day: see the server commands",
+    "pos1 / pos2 [x y z]  mark a corner of the selection (at your feet, or there)",
+    "desel           clear the selection",
+    "copy / cut / erase   copy, cut or empty the selection",
+    "paste [here]    start placing the clipboard (here: place it right now)",
+    "rotate          turn what you are placing a quarter turn",
+    "pasteair [on|off]  whether empty space in the clipboard also clears blocks",
+    "undo            undo the last building change",
+    "prefab save|load|delete <name>   save the selection, or load / delete a prefab",
+    "prefab list     list the saved prefabs",
+    "prefabs         open the prefab menu (also P)",
     "menu            save and go back to the main menu",
     "quit            close the game",
 ];
@@ -48,6 +63,32 @@ pub enum Command {
     Zoom(f32),
     /// Sin argumentos lista los ajustes; con clave y valor cambia uno.
     Set(Option<(String, String)>),
+    /// Abrir el panel de cielo y luz.
+    Sky,
+    /// Sin argumentos lista los valores del ambiente; con clave y valor cambia uno.
+    Env(Option<(String, String)>),
+    /// Volver al ambiente por defecto.
+    EnvReset,
+    /// Guardar el ambiente en su archivo.
+    EnvSave,
+    /// Marcar una esquina de la selección (la primera o la segunda): en ese voxel o, sin
+    /// coordenadas, a los pies del jugador.
+    Corner(bool, Option<[i32; 3]>),
+    Deselect,
+    /// Copiar, cortar o vaciar la selección.
+    Region(RegionAction),
+    /// Empezar a colocar el portapapeles o, con `here`, pegarlo ya.
+    Paste { here: bool },
+    Rotate,
+    /// Sin argumento dice si se pega también el aire; con él lo cambia.
+    PasteAir(Option<bool>),
+    Undo,
+    PrefabSave(String),
+    PrefabLoad(String),
+    PrefabDelete(String),
+    PrefabList,
+    /// Abrir el menú de prefabs.
+    Prefabs,
     Menu,
     Quit,
     /// No es del cliente: la línea se envía al servidor.
@@ -93,6 +134,50 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 _ => Err(format!("'{slot}' is not a hotbar slot (1-9).")),
             },
             _ => Err("Usage: give <item> [slot]".into()),
+        },
+        "pos1" | "pos2" => {
+            let first = name == "pos1";
+            match args[..] {
+                [] => Ok(Command::Corner(first, None)),
+                [x, y, z] => match (x.parse(), y.parse(), z.parse()) {
+                    (Ok(x), Ok(y), Ok(z)) => Ok(Command::Corner(first, Some([x, y, z]))),
+                    _ => Err(format!("Usage: {name} [x y z] (whole numbers)")),
+                },
+                _ => Err(format!("Usage: {name} [x y z]")),
+            }
+        }
+        "desel" => no_args(Command::Deselect),
+        "copy" => no_args(Command::Region(RegionAction::Copy)),
+        "cut" => no_args(Command::Region(RegionAction::Cut)),
+        "erase" => no_args(Command::Region(RegionAction::Erase)),
+        "undo" => no_args(Command::Undo),
+        "rotate" => no_args(Command::Rotate),
+        "paste" => match args[..] {
+            [] => Ok(Command::Paste { here: false }),
+            ["here"] => Ok(Command::Paste { here: true }),
+            _ => Err("Usage: paste [here]".into()),
+        },
+        "pasteair" => match args[..] {
+            [] => Ok(Command::PasteAir(None)),
+            ["on"] => Ok(Command::PasteAir(Some(true))),
+            ["off"] => Ok(Command::PasteAir(Some(false))),
+            _ => Err("Usage: pasteair [on|off]".into()),
+        },
+        "prefab" => match args[..] {
+            ["save", prefab] => Ok(Command::PrefabSave(prefab.to_string())),
+            ["load", prefab] => Ok(Command::PrefabLoad(prefab.to_string())),
+            ["delete", prefab] => Ok(Command::PrefabDelete(prefab.to_string())),
+            ["list"] => Ok(Command::PrefabList),
+            _ => Err("Usage: prefab save|load|delete <name>, or prefab list".into()),
+        },
+        "prefabs" => no_args(Command::Prefabs),
+        "sky" => no_args(Command::Sky),
+        "env" => match args[..] {
+            [] => Ok(Command::Env(None)),
+            ["reset"] => Ok(Command::EnvReset),
+            ["save"] => Ok(Command::EnvSave),
+            [key, value] => Ok(Command::Env(Some((key.to_string(), value.to_string())))),
+            _ => Err("Usage: env [key value], env reset or env save".into()),
         },
         "menu" => no_args(Command::Menu),
         "quit" | "exit" => no_args(Command::Quit),
@@ -143,7 +228,24 @@ mod tests {
         assert_eq!(parse("mode"), Ok(Command::Mode(None)));
         assert_eq!(parse("mode creative"), Ok(Command::Mode(Some("creative".into()))));
         assert_eq!(parse("zoom 12.5"), Ok(Command::Zoom(12.5)));
+        assert_eq!(parse("pos1"), Ok(Command::Corner(true, None)));
+        assert_eq!(parse("pos2 4 -5 6"), Ok(Command::Corner(false, Some([4, -5, 6]))));
+        assert_eq!(parse("cut"), Ok(Command::Region(RegionAction::Cut)));
+        assert_eq!(parse("paste"), Ok(Command::Paste { here: false }));
+        assert_eq!(parse("paste here"), Ok(Command::Paste { here: true }));
+        assert_eq!(parse("pasteair on"), Ok(Command::PasteAir(Some(true))));
+        assert_eq!(parse("prefab save trees/oak"), Ok(Command::PrefabSave("trees/oak".into())));
+        assert_eq!(parse("prefab list"), Ok(Command::PrefabList));
+        assert_eq!(parse("prefabs"), Ok(Command::Prefabs));
         assert_eq!(parse("set"), Ok(Command::Set(None)));
+        assert_eq!(parse("sky"), Ok(Command::Sky));
+        assert_eq!(parse("env"), Ok(Command::Env(None)));
+        assert_eq!(parse("env reset"), Ok(Command::EnvReset));
+        assert_eq!(
+            parse("env day.zenith #3366CC"),
+            Ok(Command::Env(Some(("day.zenith".into(), "#3366CC".into()))))
+        );
+        assert!(parse("env sun").is_err());
         assert_eq!(parse("set fov 90"), Ok(Command::Set(Some(("fov".into(), "90".into())))));
         assert_eq!(
             parse("set name Dante Storm"),
@@ -159,6 +261,11 @@ mod tests {
         assert!(parse("give lamp 0").is_err());
         assert!(parse("give").is_err());
         assert!(parse("zoom far").is_err());
+        assert!(parse("pos1 1 2").is_err());
+        assert!(parse("pos2 a b c").is_err());
+        assert!(parse("paste there").is_err());
+        assert!(parse("prefab save").is_err());
+        assert!(parse("prefab").is_err());
         assert!(parse("zoom").is_err());
         assert_eq!(parse("set fov"), Err("Usage: set <key> <value>".into()));
     }
@@ -167,5 +274,6 @@ mod tests {
     fn everything_else_goes_to_the_server() {
         assert_eq!(parse("tp 0 80 0"), Ok(Command::Server("tp 0 80 0".into())));
         assert_eq!(parse("  seed"), Ok(Command::Server("seed".into())));
+        assert_eq!(parse("time set dusk"), Ok(Command::Server("time set dusk".into())));
     }
 }

@@ -14,6 +14,8 @@ use super::style;
 pub enum Request {
     Resume,
     Settings,
+    /// Abrir el editor de biomas (en su propia ventana).
+    BiomeEditor,
     /// Guardar, salir del mundo y volver al menú principal.
     Leave,
     /// Guardar y cerrar el juego.
@@ -24,6 +26,7 @@ pub enum Request {
 pub enum Message {
     Resume,
     Settings,
+    BiomeEditor,
     Leave,
     Quit,
 }
@@ -47,6 +50,7 @@ impl Screen for PauseMenu {
         self.requests.push(match message {
             Message::Resume => Request::Resume,
             Message::Settings => Request::Settings,
+            Message::BiomeEditor => Request::BiomeEditor,
             Message::Leave => Request::Leave,
             Message::Quit => Request::Quit,
         });
@@ -58,12 +62,13 @@ impl Screen for PauseMenu {
             column![
                 style::menu_button("Back to game").on_press(Message::Resume),
                 style::menu_button("Settings").on_press(Message::Settings),
+                style::menu_button("Biome editor").on_press(Message::BiomeEditor),
                 style::menu_button("Save and exit to menu").on_press(Message::Leave),
                 style::menu_button("Save and quit game").style(button::secondary).on_press(Message::Quit),
             ]
             .spacing(10)
             .padding([12, 0]),
-            text("E: blocks   º / F1: console   F3: debug info").size(13).color(style::MUTED),
+            text("E: blocks   º / F1: console   F3: debug info   F7: biome editor").size(13).color(style::MUTED),
         ]
         .spacing(6)
         .align_x(Alignment::Center)
@@ -84,6 +89,7 @@ mod tests {
         for (message, request) in [
             (Message::Resume, Request::Resume),
             (Message::Settings, Request::Settings),
+            (Message::BiomeEditor, Request::BiomeEditor),
             (Message::Leave, Request::Leave),
             (Message::Quit, Request::Quit),
         ] {

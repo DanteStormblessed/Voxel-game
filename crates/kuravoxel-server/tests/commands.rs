@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
 use kuravoxel_common::block::Block;
-use kuravoxel_common::protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use kuravoxel_common::protocol::{ClientMsg, ServerMsg, WorldTime, PROTOCOL_VERSION};
 use kuravoxel_server::{ServerConfig, ServerHandle};
 
 struct Client {
@@ -187,6 +187,83 @@ fn the_host_places_and_fills_blocks_by_name() {
     let (error, ok) = host.command("fill 0 0 0 100 100 100 air");
     assert!(!ok && error.contains("limit"), "{error}");
 
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(world_dir);
+}
+
+#[test]
+fn the_host_sets_the_time_and_the_world_remembers_it() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let world_dir = std::env::temp_dir().join(format!("kuravoxel-time-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&world_dir);
+    let config =
+        ServerConfig { world_dir: world_dir.clone(), content_dir: workspace.join("content"), ..Default::default() };
+    let time = |client: &Client| {
+        client.wait("time", |msg| match msg {
+            ServerMsg::Time(time) => Some(time),
+            _ => None,
+        })
+    };
+
+    let server = kuravoxel_server::start(config.clone()).expect("server starts");
+    let host = Client::join(&server, true);
+    // Al entrar llega la hora del mundo: uno nuevo empieza por la mañana y con el día en marcha.
+    let initial = time(&host);
+    assert!(initial.day_length > 0.0 && (initial.hours - WorldTime::default().hours).abs() < 0.1);
+
+    let guest = Client::join(&server, false);
+    time(&guest);
+
+    // Por consola: se para el tiempo y se pone la hora; todos se enteran.
+    let (text, ok) = host.command("time cycle off");
+    assert!(ok && text.contains("stopped"), "{text}");
+    let set = WorldTime { hours: 18.5, day_length: 0.0, day: 0 };
+    let stopped_at_dusk = "Time: day 0, 18:30 (time is stopped); tonight: full moon";
+    assert_eq!(host.command("time set 18:30"), (stopped_at_dusk.into(), true));
+    assert_eq!(
+        guest.wait("time for the guest", |msg| match msg {
+            ServerMsg::Time(time) if time.hours == 18.5 => Some(time),
+            _ => None,
+        }),
+        set
+    );
+    assert_eq!(host.command("time"), (stopped_at_dusk.into(), true));
+    let (error, ok) = host.command("time set 99");
+    assert!(!ok && error.contains("not a time"), "{error}");
+
+    // Sin consola (los deslizadores del panel): mismo efecto, sin respuesta de texto.
+    host.send(ClientMsg::SetTime { hours: Some(3.25), day_length: Some(1.0) });
+    let changed = host.wait("slider", |msg| match msg {
+        ServerMsg::Time(time) if time.day_length > 0.0 => Some(time),
+        _ => None,
+    });
+    assert_eq!(changed.day_length, 10.0, "a day cannot be shorter than the minimum");
+    assert!((changed.hours - 3.25).abs() < 0.2);
+
+    // Un invitado no puede: ni por consola ni con el mensaje.
+    let (error, ok) = guest.command("time set noon");
+    assert!(!ok && error.contains("Only the host"), "{error}");
+    guest.send(ClientMsg::SetTime { hours: Some(12.0), day_length: Some(0.0) });
+    host.send(ClientMsg::SetTime { hours: Some(21.0), day_length: Some(0.0) });
+    let after = time(&guest);
+    assert_eq!(after, WorldTime { hours: 21.0, day_length: 0.0, day: 0 }, "only the host's change arrives");
+
+    // La luna: saltar a la luna nueva cambia el día de esta noche, y todos lo reciben.
+    let (text, ok) = host.command("time moon new");
+    assert!(ok && text.contains("tonight: new moon"), "{text}");
+    let moonless = time(&guest);
+    assert_eq!(moonless.moon_phase(), "new moon");
+    assert_eq!((moonless.day, moonless.hours), (4, 21.0), "the hour does not change");
+    let (text, ok) = host.command("time day 0");
+    assert!(ok && text.contains("full moon"), "{text}");
+    assert!(!guest.command("time moon full").1, "a guest cannot change the moon either");
+    host.command("time moon new");
+
+    // Al reiniciar, el mundo sigue en la hora (y el día) en que se dejó.
+    server.shutdown();
+    let server = kuravoxel_server::start(config).expect("server restarts");
+    let host = Client::join(&server, true);
+    assert_eq!(time(&host), WorldTime { hours: 21.0, day_length: 0.0, day: 4 });
     server.shutdown();
     let _ = std::fs::remove_dir_all(world_dir);
 }

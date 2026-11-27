@@ -10,6 +10,7 @@ kuravoxel-common.workspace = true
 kuravoxel-server.workspace = true
 kuravoxel-client.workspace = true
 kuravoxel-ui.workspace = true
+glam.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -24,3 +25,7 @@ path = "src/main.rs"
 [[bin]]
 name = "tokikura-server"
 path = "src/bin/server.rs"
+
+[[bin]]
+name = "tokikura-worldmap"
+path = "src/bin/worldmap.rs"

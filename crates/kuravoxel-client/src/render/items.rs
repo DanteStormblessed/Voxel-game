@@ -60,10 +60,7 @@ impl ItemRenderer {
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("item shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/item.wgsl").into()),
-        });
+        let shader = super::scene_shader(device, "item shader", include_str!("shaders/item.wgsl"));
         let item_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("item layout"),
             entries: &[wgpu::BindGroupLayoutEntry {

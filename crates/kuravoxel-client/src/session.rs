@@ -11,8 +11,11 @@ use kuravoxel_common::content::ContentData;
 use kuravoxel_common::chunk::{CHUNK_SIZE, CHUNK_SIZE_I};
 use kuravoxel_common::physics::MoveMode;
 use kuravoxel_common::shape::{BlockTable, Collision};
+use kuravoxel_common::prefab::{Prefab, PrefabInfo};
 use kuravoxel_common::protocol::{
-    ClientMsg, DropId, PlayerId, ServerMsg, PROTOCOL_VERSION, REACH, TICK_RATE, VERTICAL_RADIUS,
+    ClientMsg, DropId, PlayerId, PrefabOp, ServerMsg, TerrainOp, TerrainStatus, WorldTime, PROTOCOL_VERSION, REACH,
+    TICK_RATE,
+    VERTICAL_RADIUS,
 };
 use kuravoxel_common::content::ItemId;
 use kuravoxel_server::{ServerConfig, ServerHandle};
@@ -25,7 +28,7 @@ use crate::camera::{Camera, Input, MOUSE_SENSITIVITY};
 use crate::mesher;
 use crate::player::{Player, ViewKind, MAP_MIN, THIRD_PERSON_MAX};
 use crate::net::Connection;
-use crate::render::{Renderer, SceneView};
+use crate::render::{Renderer, SceneView, ShadowQuality};
 use crate::world::{World, WorldEvent};
 
 /// Rapidez con la que los demás jugadores se acercan a su última posición conocida.
@@ -56,19 +59,42 @@ pub struct SessionConfig {
     pub content_dir: PathBuf,
 }
 
+/// Cuántos frames por segundo dibuja el motor como mucho.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FrameLimit {
+    /// Los que muestra el monitor de la ventana (los de más nunca llegan a verse).
+    #[default]
+    Display,
+    Fps(u32),
+    /// Sin límite: la GPU o la CPU marcan el ritmo (para medir).
+    Unlimited,
+}
+
 /// Ajustes del cliente que pueden cambiar con el juego en marcha.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClientSettings {
     pub vsync: bool,
+    pub max_fps: FrameLimit,
+    /// Tope mientras no se juega (ventana sin foco o el juego en pausa); con la ventana
+    /// minimizada u oculta, la mitad. 0 = sin rebaja.
+    pub background_fps: u32,
     /// Campo de visión vertical, en grados.
     pub fov_degrees: f32,
     /// Multiplicador de la sensibilidad del ratón (1 = la normal).
     pub mouse_sensitivity: f32,
+    pub shadows: ShadowQuality,
 }
 
 impl Default for ClientSettings {
     fn default() -> Self {
-        Self { vsync: true, fov_degrees: 70.0, mouse_sensitivity: 1.0 }
+        Self {
+            vsync: true,
+            max_fps: FrameLimit::Display,
+            background_fps: 30,
+            fov_degrees: 70.0,
+            mouse_sensitivity: 1.0,
+            shadows: ShadowQuality::default(),
+        }
     }
 }
 
@@ -92,6 +118,17 @@ pub struct SessionInfo {
     pub camera_distance: f32,
     /// Voxel al que se apunta, si hay alguno al alcance.
     pub target: Option<[i32; 3]>,
+    /// Hueco justo antes de ese voxel: donde se colocaría un bloque.
+    pub target_before: Option<[i32; 3]>,
+    /// Rayo de la mira: de dónde sale y hacia dónde (unitario). Con él el juego sabe a
+    /// qué apunta el jugador aunque no sea un bloque (una cara de su selección).
+    pub aim_origin: [f64; 3],
+    pub aim_dir: [f32; 3],
+    /// Posición de la cámara y lo necesario para saber dónde cae en pantalla un punto
+    /// del mundo (`project`): la matriz de vista y el origen al que es relativa.
+    pub camera: [f64; 3],
+    pub view_proj: [[f32; 4]; 4],
+    pub view_origin: [f64; 3],
     /// Bloque (estado) del voxel al que se apunta.
     pub target_block: Option<Block>,
     /// El ratón está capturado: el jugador está mirando y editando.
@@ -102,6 +139,22 @@ pub struct SessionInfo {
     pub loaded: bool,
     /// Línea de estado (fps, contadores), actualizada dos veces por segundo.
     pub status: Arc<str>,
+    /// Hora del mundo, según el servidor.
+    pub time: WorldTime,
+}
+
+impl SessionInfo {
+    /// Dónde se ve en pantalla un punto del mundo: (x, y) de 0 a 1 desde la esquina
+    /// superior izquierda. `None` si queda detrás de la cámara o fuera de la imagen.
+    pub fn project(&self, point: [f64; 3]) -> Option<[f32; 2]> {
+        let rel = (DVec3::from_array(point) - DVec3::from_array(self.view_origin)).as_vec3();
+        let clip = glam::Mat4::from_cols_array_2d(&self.view_proj) * rel.extend(1.0);
+        if clip.w <= 0.01 {
+            return None;
+        }
+        let (x, y) = (clip.x / clip.w, clip.y / clip.w);
+        (x.abs() <= 1.0 && y.abs() <= 1.0).then_some([(x + 1.0) * 0.5, (1.0 - y) * 0.5])
+    }
 }
 
 /// Algo que ha pasado en la partida y que al juego le puede interesar.
@@ -113,6 +166,139 @@ pub enum SessionEvent {
     PickedUp(ItemId),
     /// Respuesta del servidor a un comando de consola.
     CommandOutput { text: String, ok: bool },
+    /// Clic con una herramienta activa (`Session::set_tool`): no edita nada, el juego
+    /// decide qué hace. Lleva el voxel apuntado y el hueco anterior, si hay alguno.
+    ToolClick { button: ToolButton, hit: Option<[i32; 3]>, before: Option<[i32; 3]> },
+    /// Se ha soltado un botón con una herramienta activa (fin de un arrastre).
+    ToolRelease { button: ToolButton },
+    /// Resultado de una orden de construcción (`Session::prefab_op`).
+    PrefabResult { text: String, ok: bool },
+    /// El servidor ha dejado esto en el portapapeles del jugador.
+    Clipboard { prefab: Arc<Prefab>, name: String },
+    /// Prefabs guardados en el servidor.
+    PrefabList(Vec<PrefabInfo>),
+    /// Estado del generador de terreno (recarga, cambios esperando, perfiles). Solo le
+    /// llega al anfitrión.
+    TerrainStatus(TerrainStatus),
+}
+
+/// Botón del ratón de un `ToolClick`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolButton {
+    Primary,
+    Secondary,
+    Middle,
+}
+
+impl ToolButton {
+    fn from_mouse(button: MouseButton) -> Option<ToolButton> {
+        match button {
+            MouseButton::Left => Some(ToolButton::Primary),
+            MouseButton::Right => Some(ToolButton::Secondary),
+            MouseButton::Middle => Some(ToolButton::Middle),
+            _ => None,
+        }
+    }
+}
+
+/// Caja que se dibuja solo con sus aristas, de `min` a `max` en metros del mundo. Puede
+/// ser plana (una cara: `min` y `max` iguales en un eje).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Outline {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+    pub color: [f32; 3],
+    /// Grosor relativo de las aristas (1 = el normal).
+    pub weight: f32,
+    /// Opacidad del relleno de sus caras, con rejilla de bloques (0 = solo aristas).
+    pub fill: f32,
+}
+
+/// Vista previa de un prefab: sus voxeles visibles como cubos algo encogidos.
+#[derive(Clone, Debug)]
+pub struct Ghost {
+    pub prefab: Arc<Prefab>,
+    /// Voxel del mundo donde cae su esquina mínima.
+    pub origin: [i32; 3],
+}
+
+/// Marcas que el juego pide dibujar sobre el mundo (una selección, lo que se va a
+/// pegar). El motor no sabe qué significan.
+#[derive(Clone, Debug, Default)]
+pub struct Overlay {
+    pub outlines: Vec<Outline>,
+    pub ghost: Option<Ghost>,
+}
+
+impl PartialEq for Overlay {
+    fn eq(&self, other: &Self) -> bool {
+        let same_ghost = match (&self.ghost, &other.ghost) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(&a.prefab, &b.prefab) && a.origin == b.origin,
+            _ => false,
+        };
+        same_ghost && self.outlines == other.outlines
+    }
+}
+
+/// Cubos que se dibujan como mucho en una vista previa; el resto se reparte salteado.
+const MAX_GHOST_BOXES: usize = 12_000;
+/// Lado de cada cubo de la vista previa. Un pelo más que el voxel: los cubos vecinos se
+/// unen sin costuras y, si se coloca sobre bloques iguales, no parpadea contra ellos.
+const GHOST_BOX: f32 = 1.004;
+/// Cuánto se aclara la vista previa hacia el blanco, para distinguirla de lo construido.
+const GHOST_TINT: f32 = 0.1;
+
+/// Voxeles visibles de un prefab (los que tocan aire o el borde) con su color.
+fn ghost_boxes(prefab: &Prefab, content: &ContentData) -> Vec<(IVec3, [f32; 3])> {
+    let colors: Vec<[f32; 3]> = prefab
+        .resolve(content)
+        .into_iter()
+        .map(|block| match block.and_then(|block| content.block(block)) {
+            // De sRGB a lineal, que es como pinta el renderer de cajas.
+            Some(def) => def.color.map(|c| {
+                let linear = (c as f32 / 255.0).powf(2.2);
+                linear + (1.0 - linear) * GHOST_TINT
+            }),
+            None => [1.0, 0.0, 1.0],
+        })
+        .collect();
+    let size = prefab.size();
+    let mut boxes = Vec::new();
+    for y in 0..size.y {
+        for z in 0..size.z {
+            for x in 0..size.x {
+                let pos = IVec3::new(x, y, z);
+                let index = prefab.get(pos);
+                let exposed = || IVec3::AXES.iter().any(|&axis| prefab.get(pos + axis) == 0 || prefab.get(pos - axis) == 0);
+                if index != 0 && exposed() {
+                    boxes.push((pos, colors[index as usize]));
+                }
+            }
+        }
+    }
+    if boxes.len() > MAX_GHOST_BOXES {
+        let step = boxes.len().div_ceil(MAX_GHOST_BOXES);
+        boxes = boxes.into_iter().step_by(step).collect();
+    }
+    boxes
+}
+
+/// Las 12 aristas de la caja `min..max` como barras finas.
+fn push_edges(boxes: &mut Vec<(DVec3, Vec3, [f32; 3])>, min: DVec3, max: DVec3, thickness: f32, color: [f32; 3]) {
+    let center = (min + max) * 0.5;
+    let extent = (max - min).as_vec3();
+    for axis in 0..3 {
+        let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+        let mut size = Vec3::splat(thickness);
+        size[axis] = extent[axis] + thickness;
+        for (sa, sb) in [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)] {
+            let mut offset = DVec3::ZERO;
+            offset[a] = sa * (extent[a] as f64 + 0.004);
+            offset[b] = sb * (extent[b] as f64 + 0.004);
+            boxes.push((center + offset, size, color));
+        }
+    }
 }
 
 /// Otro jugador, tal como lo ve este cliente.
@@ -170,6 +356,15 @@ pub struct Session {
     selected: Block,
     /// Bloque al que se apunta y hueco anterior, recalculados cada frame.
     target: Option<(IVec3, IVec3)>,
+    /// Herramienta activa: los clics no editan, se avisan al juego, y el rayo llega
+    /// hasta esta distancia.
+    tool_reach: Option<f64>,
+    /// Marcas pedidas por el juego.
+    overlay: Overlay,
+    /// Ancho entre alto de la imagen, según el último frame.
+    aspect: f32,
+    /// Cubos de la vista previa en curso, para no recalcularlos cada frame.
+    ghost_cache: Option<(Arc<Prefab>, Vec<(IVec3, [f32; 3])>)>,
     next_move: Instant,
     last_message: Instant,
     /// El servidor ha cerrado la conexión.
@@ -188,6 +383,8 @@ pub struct Session {
     title: Arc<str>,
     /// Radio de voxeles reales calculado en el último `update`.
     clip: f32,
+    /// Hora del mundo: la da el servidor y entre aviso y aviso avanza sola.
+    time: WorldTime,
 }
 
 impl Session {
@@ -249,6 +446,10 @@ impl Session {
             content: Arc::default(),
             selected: Block::AIR,
             target: None,
+            tool_reach: None,
+            overlay: Overlay::default(),
+            aspect: 16.0 / 9.0,
+            ghost_cache: None,
             next_move: now,
             last_message: now,
             disconnected: false,
@@ -259,6 +460,7 @@ impl Session {
             dev_camera,
             title: Arc::from(""),
             clip: 0.0,
+            time: WorldTime::default(),
         })
     }
 
@@ -312,6 +514,41 @@ impl Session {
         }
     }
 
+    /// Activa (con su alcance en metros) o desactiva el modo herramienta: con él, los
+    /// clics no rompen ni colocan, llegan al juego como `SessionEvent::ToolClick`.
+    pub fn set_tool(&mut self, reach: Option<f64>) {
+        self.tool_reach = reach.map(|reach| reach.clamp(1.0, 256.0));
+    }
+
+    /// Marcas que se dibujan sobre el mundo hasta que se cambien.
+    pub fn set_overlay(&mut self, overlay: Overlay) {
+        self.overlay = overlay;
+    }
+
+    /// Envía una orden de construcción al servidor; el resultado llega como `SessionEvent`.
+    pub fn prefab_op(&mut self, op: PrefabOp) {
+        self.connection.send(ClientMsg::Prefab(op));
+    }
+
+    /// Pide al servidor cambiar la hora del mundo (0-24) o la duración del día en segundos
+    /// reales (0 = parar el tiempo). Aquí se ve al instante; si el servidor no lo acepta
+    /// (solo el anfitrión puede), su siguiente aviso de hora lo corrige.
+    pub fn set_time(&mut self, hours: Option<f32>, day_length: Option<f32>) {
+        self.time = WorldTime {
+            hours: hours.unwrap_or(self.time.hours),
+            day_length: day_length.unwrap_or(self.time.day_length),
+            ..self.time
+        }
+        .sanitized();
+        self.connection.send(ClientMsg::SetTime { hours, day_length });
+    }
+
+    /// Orden sobre el terreno (recarga, perfiles); la respuesta llega como
+    /// `SessionEvent::TerrainStatus`.
+    pub fn terrain_op(&mut self, op: TerrainOp) {
+        self.connection.send(ClientMsg::Terrain(op));
+    }
+
     /// Envía una línea de consola al servidor; la respuesta llega como `SessionEvent`.
     pub fn send_command(&mut self, line: String) {
         self.connection.send(ClientMsg::Command { line });
@@ -350,11 +587,18 @@ impl Session {
             view: self.player.view(),
             camera_distance: self.player.camera_distance(),
             target: self.target.map(|(hit, _)| hit.to_array()),
+            target_before: self.target.map(|(_, before)| before.to_array()),
+            aim_origin: self.player.pivot(&self.world).to_array(),
+            aim_dir: self.player.forward().to_array(),
+            camera: self.camera.pos.to_array(),
+            view_proj: self.camera.view_proj(self.aspect).to_cols_array_2d(),
+            view_origin: (self.camera.chunk_pos().as_dvec3() * CHUNK_SIZE as f64).to_array(),
             target_block: self.target.and_then(|(hit, _)| self.world.block_at(hit)),
             grabbed: self.grabbed,
             hosting: self.server.is_some(),
             loaded: self.loading_since.is_none(),
             status: self.title.clone(),
+            time: self.time,
         }
     }
 
@@ -369,6 +613,15 @@ impl Session {
 
     /// Clic con el ratón capturado: romper, colocar o copiar el bloque apuntado.
     fn on_click(&mut self, button: MouseButton) {
+        if self.tool_reach.is_some() {
+            let Some(button) = ToolButton::from_mouse(button) else { return };
+            self.outbox.push(SessionEvent::ToolClick {
+                button,
+                hit: self.target.map(|(hit, _)| hit.to_array()),
+                before: self.target.map(|(_, before)| before.to_array()),
+            });
+            return;
+        }
         let Some((hit, before)) = self.target else { return };
         // Celdas que cambian: un objeto de varias celdas (una puerta) se pone y se quita
         // entero, igual que hará el servidor.
@@ -461,6 +714,7 @@ impl Session {
                     renderer.set_item_shapes(&content, &blocks, &mesh_table);
                     self.world.set_tables(Arc::new(blocks), Arc::new(mesh_table));
                     self.content = content;
+                    self.ghost_cache = None;
                     // Si el bloque elegido ya no existe, ninguno: el juego elegirá otro.
                     if !self.block_exists(self.selected) {
                         self.selected = Block::AIR;
@@ -512,6 +766,15 @@ impl Session {
                 ServerMsg::CommandOutput { text, ok } => {
                     self.outbox.push(SessionEvent::CommandOutput { text, ok })
                 }
+                ServerMsg::PrefabResult { text, ok } => {
+                    self.outbox.push(SessionEvent::PrefabResult { text, ok })
+                }
+                ServerMsg::Clipboard { prefab, name } => {
+                    self.outbox.push(SessionEvent::Clipboard { prefab, name })
+                }
+                ServerMsg::PrefabList(list) => self.outbox.push(SessionEvent::PrefabList(list)),
+                ServerMsg::Time(time) => self.time = time.sanitized(),
+                ServerMsg::TerrainStatus(status) => self.outbox.push(SessionEvent::TerrainStatus(status)),
             }
         }
     }
@@ -519,6 +782,8 @@ impl Session {
     /// Avanza la partida un frame: red, movimiento, mundo y lo que hay que dibujar.
     /// No dibuja: deja el renderer listo para que el motor llame a `render`.
     pub fn update(&mut self, renderer: &mut Renderer, now: Instant, dt: f32) {
+        // La hora avanza sola entre un aviso del servidor y el siguiente.
+        self.time = self.time.advanced(dt);
         self.receive(renderer, now);
 
         let mut clip = 0.0;
@@ -579,7 +844,10 @@ impl Session {
         // el punto de mira señala lo mismo que en primera. En la vista de mapa no se edita.
         let view = self.player.view();
         self.target = (view != ViewKind::Map)
-            .then(|| self.world.raycast(self.player.pivot(&self.world), self.player.forward(), REACH))
+            .then(|| {
+                let reach = self.tool_reach.unwrap_or(REACH);
+                self.world.raycast(self.player.pivot(&self.world), self.player.forward(), reach)
+            })
             .flatten();
         let mut boxes = Vec::new();
         if view == ViewKind::Map {
@@ -607,6 +875,39 @@ impl Session {
                     boxes.push((center + offset, size, [0.02, 0.02, 0.02]));
                 }
             }
+        }
+        // Marcas del juego: contornos (más gruesos cuanto más lejos, para que se vean) y
+        // la vista previa de lo que se va a pegar.
+        // Van en un pase aparte, sin prueba de profundidad: se ven a través del terreno.
+        self.aspect = renderer.aspect();
+        let mut marks: Vec<(DVec3, Vec3, [f32; 4], bool)> = Vec::new();
+        let mut edges = Vec::new();
+        for outline in &self.overlay.outlines {
+            let (min, max) = (DVec3::from_array(outline.min), DVec3::from_array(outline.max));
+            let [r, g, b] = outline.color;
+            if outline.fill > 0.0 {
+                marks.push(((min + max) * 0.5, (max - min).as_vec3(), [r, g, b, outline.fill], true));
+            }
+            let nearest = self.camera.pos.clamp(min, max);
+            let thickness =
+                (self.camera.pos.distance(nearest) as f32 * 0.004).clamp(0.03, 0.5) * outline.weight;
+            edges.clear();
+            push_edges(&mut edges, min, max, thickness, outline.color);
+            marks.extend(edges.iter().map(|&(center, size, _)| (center, size, [r, g, b, 0.95], false)));
+        }
+        renderer.set_marks(&self.camera, &marks);
+        if let Some(ghost) = &self.overlay.ghost {
+            if !self.ghost_cache.as_ref().is_some_and(|(prefab, _)| Arc::ptr_eq(prefab, &ghost.prefab)) {
+                self.ghost_cache = Some((ghost.prefab.clone(), ghost_boxes(&ghost.prefab, &self.content)));
+            }
+            let origin = IVec3::from_array(ghost.origin);
+            if let Some((_, cubes)) = &self.ghost_cache {
+                boxes.extend(cubes.iter().map(|&(pos, color)| {
+                    ((origin + pos).as_dvec3() + DVec3::splat(0.5), Vec3::splat(GHOST_BOX), color)
+                }));
+            }
+        } else {
+            self.ghost_cache = None;
         }
         renderer.set_entities(
             &self.camera,
@@ -695,7 +996,8 @@ impl Session {
         let pos = self.player.body.eye();
         let title = format!(
             "{fps:.0} fps | block: {} | players {} | chunks {} (meshing {}) | far {} | \
-             meshes {} visible {} | quads {} | draws {} | pos {:.0} {:.0} {:.0}",
+             meshes {} visible {} | quads {} | draws {} + {} shadow | time {} | \
+             pos {:.0} {:.0} {:.0}",
             self.selected_name(),
             self.players.len() + 1,
             world.chunks,
@@ -705,6 +1007,8 @@ impl Session {
             render.visible,
             render.quads,
             render.draw_calls,
+            render.shadow_draw_calls,
+            self.time.clock(),
             pos.x,
             pos.y,
             pos.z,
@@ -724,6 +1028,12 @@ impl Session {
             WindowEvent::Focused(false) => {
                 self.set_grab(window, false);
                 self.input = Input::default();
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button, .. } => {
+                // Con una herramienta, soltar el botón también cuenta (termina un arrastre).
+                if let (true, Some(_), Some(button)) = (self.grabbed, self.tool_reach, ToolButton::from_mouse(*button)) {
+                    self.outbox.push(SessionEvent::ToolRelease { button });
+                }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
                 // El primer clic captura el ratón; con el ratón capturado, edita.
@@ -788,6 +1098,8 @@ impl Session {
                 ((eye_chunk + meshed + 1) * CHUNK_SIZE_I) as f64,
             ],
             focus: self.player.body.visual_eye(),
+            time: self.time.hours,
+            moon_age: self.time.moon_age(),
         }
     }
 

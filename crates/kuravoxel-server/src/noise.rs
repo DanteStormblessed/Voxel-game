@@ -14,18 +14,22 @@ pub fn hash2(x: i32, y: i32, seed: u32) -> u32 {
     h
 }
 
+/// Las 8 direcciones de gradiente. Una tabla en vez de un `match`: el índice sale de un
+/// hash, así que una rama aquí se predice mal casi siempre.
+const GRADIENTS: [[f32; 2]; 8] =
+    [[1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
+
 #[inline(always)]
 fn grad(hash: u32, x: f32, y: f32) -> f32 {
-    match hash & 7 {
-        0 => x + y,
-        1 => x - y,
-        2 => y - x,
-        3 => -x - y,
-        4 => x,
-        5 => -x,
-        6 => y,
-        _ => -y,
-    }
+    let [gx, gy] = GRADIENTS[(hash & 7) as usize];
+    gx * x + gy * y
+}
+
+/// Parte entera hacia abajo, sin llamar a `floor` (que sin SSE4.1 es una llamada a libm).
+#[inline(always)]
+fn floor_i64(x: f64) -> i64 {
+    let truncated = x as i64;
+    truncated - (truncated as f64 > x) as i64
 }
 
 #[inline(always)]
@@ -40,9 +44,9 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 
 /// Ruido Perlin 2D, aproximadamente en [-1, 1].
 pub fn perlin2(x: f64, y: f64, seed: u32) -> f32 {
-    let (xf, yf) = (x.floor(), y.floor());
-    let (xi, yi) = (xf as i64 as i32, yf as i64 as i32);
-    let (fx, fy) = ((x - xf) as f32, (y - yf) as f32);
+    let (xl, yl) = (floor_i64(x), floor_i64(y));
+    let (xi, yi) = (xl as i32, yl as i32);
+    let (fx, fy) = ((x - xl as f64) as f32, (y - yl as f64) as f32);
     let (xi1, yi1) = (xi.wrapping_add(1), yi.wrapping_add(1));
 
     let a = grad(hash2(xi, yi, seed), fx, fy);

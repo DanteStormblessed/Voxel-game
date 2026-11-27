@@ -1,0 +1,10 @@
+name = "Arena florida amarilla"
+color = "#F4D548"
+category = "Terreno"
+tags = ["natural", "suelo", "flor"]
+
+# Solo la cara de arriba está cubierta de flores.
+[faces]
+top = "#F4D548"
+side = "#F3E3A2"
+bottom = "#F3E3A2"

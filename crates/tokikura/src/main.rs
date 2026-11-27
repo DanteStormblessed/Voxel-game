@@ -1,7 +1,10 @@
 //! Tokikura: el juego. Todo lo que hay aquí es específico del juego; el motor
 //! (KuraVoxel) pone la ventana, el render, la red y las partidas.
 
+mod biome_preview;
+mod builder;
 mod commands;
+mod environment;
 mod game;
 mod game_mode;
 mod hotbar;
@@ -58,7 +61,8 @@ With no arguments the game opens on the main menu.
 
 In a world: left click breaks, right click places, middle click picks, wheel or 1-9
 selects a hotbar slot, E opens the block palette, Escape opens the game menu, F1 (or
-the key left of 1) opens the developer console and F3 shows debug information.";
+the key left of 1) opens the developer console, F3 shows debug information and F6 opens
+the sky and light panel (time of day, sun, shadows, colors).";
 
 fn main() -> anyhow::Result<()> {
     // El registro sale por la terminal y, además, se copia para la consola del juego.
@@ -70,6 +74,7 @@ fn main() -> anyhow::Result<()> {
         worlds_dir: env_path("KURAVOXEL_WORLDS", "worlds"),
         content_dir: env_path("KURAVOXEL_CONTENT", "content"),
         settings_path: env_path("KURAVOXEL_SETTINGS", "settings.toml"),
+        environment_path: env_path("KURAVOXEL_ENVIRONMENT", "environment.toml"),
         seed: env_number("KURAVOXEL_SEED", DEFAULT_SEED),
         dev_open: std::env::var("KURAVOXEL_UI_OPEN").ok(),
         dev_console: std::env::var("KURAVOXEL_CONSOLE")
@@ -82,6 +87,8 @@ fn main() -> anyhow::Result<()> {
         view_distance: env_number("KURAVOXEL_VIEW_DISTANCE", saved.view_distance),
         far_distance: env_number("KURAVOXEL_FAR_DISTANCE", saved.far_distance),
         vsync: env_number("KURAVOXEL_VSYNC", saved.vsync as u8) != 0,
+        max_fps: std::env::var("KURAVOXEL_MAX_FPS").unwrap_or(saved.max_fps.clone()),
+        background_fps: env_number("KURAVOXEL_BACKGROUND_FPS", saved.background_fps),
         ..saved
     }
     .sanitized();

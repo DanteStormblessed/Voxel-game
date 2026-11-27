@@ -372,6 +372,20 @@ impl ContentData {
         self.find_state(state.block, orientation.place(normal, look), state.part).unwrap_or(block)
     }
 
+    /// El mismo bloque tras girar el mundo `turns` cuartos de vuelta alrededor de la
+    /// vertical (norte → este): cambia el `facing` o el `axis`; la parte se conserva.
+    pub fn rotate_y(&self, block: Block, turns: u8) -> Block {
+        let Some(state) = self.state(block) else { return block };
+        let turned = match self.blocks[state.block as usize].orientation {
+            Orientation::None => return block,
+            // x ↔ z con un número impar de cuartos.
+            Orientation::Axis if turns % 2 == 1 && state.state != 1 => 2 - state.state,
+            Orientation::Axis => state.state,
+            Orientation::Horizontal => (state.state + turns % 4) % 4,
+        };
+        self.find_state(state.block, turned, state.part).unwrap_or(block)
+    }
+
     /// Todas las celdas del objeto al que pertenece el estado `block` puesto en `pos`:
     /// (posición, estado). Un bloque normal es solo él; una puerta, sus dos mitades,
     /// giradas según su orientación.
@@ -755,10 +769,45 @@ struct BlockFile {
     /// Genera su ítem (por defecto sí).
     item: Option<bool>,
     model: Option<String>,
+    /// Lado del `.vox` que es el frente del modelo (por defecto el norte, +Y en
+    /// MagicaVoxel). Con otro valor el modelo se gira al cargarlo.
+    model_front: Option<ModelFront>,
     cell: Option<[u8; 3]>,
     collision: Option<CollisionFile>,
     opacity: Option<f32>,
     icon: Option<IconFile>,
+}
+
+/// Hacia dónde mira el frente de un modelo tal como está dibujado en su archivo.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ModelFront {
+    #[default]
+    North,
+    East,
+    South,
+    West,
+}
+
+impl ModelFront {
+    /// Cuartos de vuelta (norte → este) que llevan ese lado al norte.
+    fn turns_to_north(self) -> u8 {
+        match self {
+            ModelFront::North => 0,
+            ModelFront::East => 3,
+            ModelFront::South => 2,
+            ModelFront::West => 1,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ModelFront::North => "north",
+            ModelFront::East => "east",
+            ModelFront::South => "south",
+            ModelFront::West => "west",
+        }
+    }
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -824,6 +873,7 @@ impl Inherit for BlockFile {
             tags: self.tags.or_else(|| parent.tags.clone()),
             item: self.item.or(parent.item),
             model: self.model.or_else(|| parent.model.clone()),
+            model_front: self.model_front.or(parent.model_front),
             cell: self.cell.or(parent.cell),
             collision: self.collision.or_else(|| parent.collision.clone()),
             opacity: self.opacity.or(parent.opacity),
@@ -960,7 +1010,7 @@ fn block_def(id: &str, file: &BlockFile, icons: &BTreeMap<String, IconImage>) ->
     })
 }
 
-fn sorted_entries(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub fn sorted_entries(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("failed to read {}", dir.display()))?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -970,14 +1020,14 @@ fn sorted_entries(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 /// Carpetas de paquete dentro de `dir`: `base` primero, el resto por orden alfabético.
-fn packs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub fn packs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut packs: Vec<PathBuf> =
         sorted_entries(dir)?.into_iter().filter(|path| path.is_dir()).collect();
     packs.sort_by_key(|path| path.file_name().map_or(true, |name| name != "base"));
     Ok(packs)
 }
 
-fn stem(path: &Path) -> String {
+pub fn stem(path: &Path) -> String {
     path.file_stem().unwrap_or_default().to_string_lossy().into_owned()
 }
 
@@ -1022,12 +1072,23 @@ pub fn load(dir: &Path) -> anyhow::Result<Loaded> {
     let raw: BTreeMap<String, BlockFile> =
         block_files.iter().map(|(id, (_, file))| (id.clone(), file.clone())).collect();
     let mut blocks = Vec::new();
+    // Modelos que algún bloque usa girados: (modelo, frente dibujado).
+    let mut turned: Vec<(String, ModelFront)> = Vec::new();
     for (id, file) in resolve_inheritance(&raw)? {
         if file.template {
             continue;
         }
         let path = &block_files[&id].0;
-        blocks.push(block_def(&id, &file, &icons).with_context(|| format!("error in {}", path.display()))?);
+        let mut def = block_def(&id, &file, &icons).with_context(|| format!("error in {}", path.display()))?;
+        // Un modelo dibujado con el frente hacia otro lado se usa a través de una copia
+        // ya girada (`base:furnace#south`): el resto del motor no nota la diferencia.
+        if let (Some(model), Some(front)) = (&def.model, file.model_front.filter(|f| *f != ModelFront::North)) {
+            if !turned.contains(&(model.clone(), front)) {
+                turned.push((model.clone(), front));
+            }
+            def.model = Some(format!("{model}#{}", front.name()));
+        }
+        blocks.push(def);
     }
     if blocks.is_empty() {
         bail!("no blocks defined in {}", dir.display());
@@ -1067,10 +1128,18 @@ pub fn load(dir: &Path) -> anyhow::Result<Loaded> {
             icon,
         });
     }
-    let models = load_assets(dir, "models", "vox", |bytes| model::parse_vox(bytes))?
+    let mut models: Vec<ModelDef> = load_assets(dir, "models", "vox", |bytes| model::parse_vox(bytes))?
         .into_iter()
         .map(|(id, model)| ModelDef { id, model })
         .collect();
+    for (id, front) in turned {
+        // Si el modelo no existe, `assign` lo dirá al no encontrar la copia girada.
+        if let Some(source) = models.iter().find(|model| model.id == id) {
+            let model = source.model.rotated_y(front.turns_to_north());
+            models.push(ModelDef { id: format!("{id}#{}", front.name()), model });
+        }
+    }
+    models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Loaded { blocks, items, models })
 }
 
@@ -1111,6 +1180,12 @@ pub fn fingerprint(dir: &Path) -> (usize, Option<SystemTime>) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // Los prefabs no forman parte de `ContentData`: guardar uno desde el
+                // juego no debe recargar bloques e ítems.
+                // El terreno (`worldgen/`) tampoco: tiene su propia recarga en el servidor.
+                if path.file_name().is_some_and(|name| name == "prefabs" || name == "worldgen") {
+                    continue;
+                }
                 visit(&path, count, newest);
             } else if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
                 *count += 1;

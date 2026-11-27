@@ -6,6 +6,7 @@ use glam::{IVec3, Vec2, Vec3};
 use rustc_hash::FxHashMap;
 use wgpu::util::DeviceExt;
 
+use super::shadows::{self, Cascade};
 use crate::camera::Frustum;
 use crate::mesher::ChunkMesh;
 use kuravoxel_common::chunk::CHUNK_SIZE_I;
@@ -35,12 +36,19 @@ struct Visible {
     index: u32,
     /// Bit por cara (+X, -X, +Y, -Y, +Z, -Z) que puede estar mirando a la cámara.
     faces: u8,
+    /// Cruza el relevo entre voxeles y terreno lejano: hay que recortarlo píxel a píxel.
+    clipped: bool,
 }
 
 pub struct TerrainRenderer {
+    /// Lo opaco, sin `discard` (la GPU descarta lo tapado antes de sombrearlo).
     pipeline: wgpu::RenderPipeline,
+    /// Lo opaco que cruza el relevo entre voxeles y terreno lejano: recorta por píxel.
+    clipped_pipeline: wgpu::RenderPipeline,
     /// Segundo pase: agua y cristal, con mezcla y sin escribir profundidad.
     translucent_pipeline: wgpu::RenderPipeline,
+    /// Mapas de sombras: solo profundidad, vista desde la luz.
+    shadow_pipeline: wgpu::RenderPipeline,
 
     // Origen de cada chunk: un único buffer de uniforms direccionado con offset dinámico.
     // Funciona igual en Vulkan y en GLES 3 (sin push constants ni storage buffers).
@@ -57,19 +65,19 @@ pub struct TerrainRenderer {
     index: FxHashMap<MeshKey, usize>,
     visible: Vec<Visible>,
     total_quads: u64,
+    /// Sube con cada malla de voxeles reales que entra o sale (lo que da sombra).
+    shadow_version: u64,
 }
 
 impl TerrainRenderer {
     pub fn new(
         device: &wgpu::Device,
         globals_layout: &wgpu::BindGroupLayout,
+        shadow_layout: &wgpu::BindGroupLayout,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("terrain shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/terrain.wgsl").into()),
-        });
+        let shader = super::scene_shader(device, "terrain shader", include_str!("shaders/terrain.wgsl"));
 
         let chunk_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("chunk layout"),
@@ -91,7 +99,7 @@ impl TerrainRenderer {
             push_constant_ranges: &[],
         });
 
-        let pipeline_for = |label: &str, translucent: bool| {
+        let pipeline_for = |label: &str, translucent: bool, fragment: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -128,7 +136,7 @@ impl TerrainRenderer {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(fragment),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: color_format,
@@ -140,8 +148,47 @@ impl TerrainRenderer {
                 cache: None,
             })
         };
-        let pipeline = pipeline_for("terrain pipeline", false);
-        let translucent_pipeline = pipeline_for("translucent terrain pipeline", true);
+        let pipeline = pipeline_for("terrain pipeline", false, "fs_main");
+        let clipped_pipeline = pipeline_for("clipped terrain pipeline", false, "fs_clipped");
+        // Lo translúcido no escribe profundidad: recortar siempre no le quita nada.
+        let translucent_pipeline = pipeline_for("translucent terrain pipeline", true, "fs_clipped");
+
+        let quad_buffers = [wgpu::VertexBufferLayout {
+            array_stride: QUAD_BYTES,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Uint32x2,
+                offset: 0,
+                shader_location: 0,
+            }],
+        }];
+        let shadow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terrain shadow pipeline layout"),
+            bind_group_layouts: &[shadow_layout, &chunk_layout],
+            push_constant_ranges: &[],
+        });
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terrain shadow pipeline"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &super::shadow_shader(device),
+                entry_point: Some("vs_terrain"),
+                compilation_options: Default::default(),
+                buffers: &quad_buffers,
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                front_face: wgpu::FrontFace::Ccw,
+                // Qué caras se dibujan lo elige `draw_shadow`.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(shadows::depth_state()),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
+            multiview: None,
+            cache: None,
+        });
 
         let slot_stride =
             (device.limits().min_uniform_buffer_offset_alignment as u64).max(CHUNK_UNIFORM_BYTES);
@@ -150,7 +197,9 @@ impl TerrainRenderer {
 
         Self {
             pipeline,
+            clipped_pipeline,
             translucent_pipeline,
+            shadow_pipeline,
             chunk_layout,
             chunk_uniforms,
             chunk_bind_group,
@@ -163,6 +212,7 @@ impl TerrainRenderer {
             index: FxHashMap::default(),
             visible: Vec::new(),
             total_quads: 0,
+            shadow_version: 0,
         }
     }
 
@@ -176,6 +226,11 @@ impl TerrainRenderer {
 
     pub fn total_quads(&self) -> u64 {
         self.total_quads
+    }
+
+    /// Sube cada vez que cambia algo que da sombra (una malla de voxeles reales).
+    pub fn shadow_version(&self) -> u64 {
+        self.shadow_version
     }
 
     /// Sube (o reemplaza) la malla de un chunk.
@@ -201,6 +256,9 @@ impl TerrainRenderer {
 
         let quads = mesh.quads.len() as u32;
         self.total_quads += quads as u64;
+        if scale == 1 {
+            self.shadow_version += 1;
+        }
         self.index.insert(key, self.chunks.len());
         self.chunks.push(GpuChunk {
             key,
@@ -222,6 +280,7 @@ impl TerrainRenderer {
         self.index.clear();
         self.visible.clear();
         self.total_quads = 0;
+        self.shadow_version += 1;
     }
 
     pub fn remove(&mut self, key: MeshKey) {
@@ -229,6 +288,9 @@ impl TerrainRenderer {
         let removed = self.chunks.swap_remove(i);
         self.free_slots.push(removed.slot);
         self.total_quads -= removed.quads as u64;
+        if removed.scale == 1 {
+            self.shadow_version += 1;
+        }
         if let Some(moved) = self.chunks.get(i) {
             self.index.insert(moved.key, i);
         }
@@ -310,14 +372,18 @@ impl TerrainRenderer {
             let near = (cam_local.clamp(min, max) - cam_local).truncate_y();
             let far = (min - cam_local).abs().max((max - cam_local).abs()).truncate_y();
             min.y -= far.length_squared() / (2.0 * curvature);
-            let skip = if chunk.scale == 1 {
-                near.length_squared() > clip * clip
+            let (skip, clipped) = if chunk.scale == 1 {
+                // Voxeles: se recortan si parte del chunk queda más allá de `clip`.
+                (near.length_squared() > clip * clip, far.length_squared() > clip * clip)
             } else {
                 // Terreno lejano tapado del todo por los voxeles: dentro del círculo y
-                // dentro de las capas de chunks que hay cargadas.
-                far.length() < clip - band
-                    && min.y >= voxel_band[0] + band
-                    && max.y <= voxel_band[1] - band
+                // dentro de las capas de chunks que hay cargadas. Si solo una parte lo
+                // está, se recorta píxel a píxel.
+                let below = min.y >= voxel_band[0] + band && max.y <= voxel_band[1] - band;
+                let touches = near.length() < clip - band
+                    && max.y > voxel_band[0] + band
+                    && min.y < voxel_band[1] - band;
+                (far.length() < clip - band && below, touches)
             };
             if skip || !frustum.intersects_aabb(min, max) {
                 continue;
@@ -336,6 +402,7 @@ impl TerrainRenderer {
                 dist_sq: (min + extent * 0.5).distance_squared(cam_local),
                 index: index as u32,
                 faces,
+                clipped,
             });
         }
         // De cerca a lejos: el z-buffer descarta pronto lo tapado (menos sobredibujado,
@@ -345,41 +412,82 @@ impl TerrainRenderer {
     }
 
     /// Dibuja los chunks elegidos por `cull`. Devuelve el número de draw calls.
+    /// Primero lo que no cruza el relevo (sin `discard`) y después lo que sí, cada grupo
+    /// de cerca a lejos.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, globals: &wgpu::BindGroup) -> u32 {
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, globals, &[]);
-
         let mut draw_calls = 0;
-        for visible in &self.visible {
-            let chunk = &self.chunks[visible.index as usize];
-            let mut bound = false;
-            // Las caras visibles contiguas en el buffer se dibujan de una vez.
-            let mut run: Option<(u32, u32)> = None;
-            for face in 0..=6 {
-                let range = (face < 6 && visible.faces & (1 << face) != 0)
-                    .then(|| chunk.face_ranges[face])
-                    .filter(|(start, end)| end > start);
-                match (run, range) {
-                    (Some((start, end)), Some((next_start, next_end))) if end == next_start => {
-                        run = Some((start, next_end));
-                    }
-                    (current, next) => {
-                        if let Some((start, end)) = current {
-                            if !bound {
-                                let offset = (chunk.slot as u64 * self.slot_stride) as u32;
-                                pass.set_bind_group(1, &self.chunk_bind_group, &[offset]);
-                                bound = true;
-                            }
-                            // El rango va en el offset del buffer y no en `first_instance`,
-                            // que en GLES no está disponible.
-                            let bytes = start as u64 * QUAD_BYTES..end as u64 * QUAD_BYTES;
-                            pass.set_vertex_buffer(0, chunk.buffer.slice(bytes));
-                            pass.draw(0..4, 0..end - start);
-                            draw_calls += 1;
-                        }
-                        run = next;
-                    }
+        for (pipeline, clipped) in [(&self.pipeline, false), (&self.clipped_pipeline, true)] {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, globals, &[]);
+            for visible in self.visible.iter().filter(|visible| visible.clipped == clipped) {
+                draw_calls += self.draw_faces(pass, &self.chunks[visible.index as usize], visible.faces);
+            }
+        }
+        draw_calls
+    }
+
+    /// Dibuja las caras pedidas (un bit por cara) de un chunk. Devuelve las draw calls.
+    fn draw_faces(&self, pass: &mut wgpu::RenderPass<'_>, chunk: &GpuChunk, faces: u8) -> u32 {
+        let mut draw_calls = 0;
+        // Las caras contiguas en el buffer se dibujan de una vez.
+        let mut run: Option<(u32, u32)> = None;
+        for face in 0..=6 {
+            let range = (face < 6 && faces & (1 << face) != 0)
+                .then(|| chunk.face_ranges[face])
+                .filter(|(start, end)| end > start);
+            match (run, range) {
+                (Some((start, end)), Some((next_start, next_end))) if end == next_start => {
+                    run = Some((start, next_end));
                 }
+                (current, next) => {
+                    if let Some((start, end)) = current {
+                        if draw_calls == 0 {
+                            let offset = (chunk.slot as u64 * self.slot_stride) as u32;
+                            pass.set_bind_group(1, &self.chunk_bind_group, &[offset]);
+                        }
+                        // El rango va en el offset del buffer y no en `first_instance`,
+                        // que en GLES no está disponible.
+                        let bytes = start as u64 * QUAD_BYTES..end as u64 * QUAD_BYTES;
+                        pass.set_vertex_buffer(0, chunk.buffer.slice(bytes));
+                        pass.draw(0..4, 0..end - start);
+                        draw_calls += 1;
+                    }
+                    run = next;
+                }
+            }
+        }
+        draw_calls
+    }
+
+    /// Dibuja en un mapa de sombras los chunks de voxeles reales que pueden dar sombra
+    /// dentro de `cascade`. Solo las caras que dan la espalda a la luz (`light` apunta
+    /// hacia ella): lo iluminado nunca se compara consigo mismo. Lo translúcido no da
+    /// sombra. Devuelve el número de draw calls.
+    pub fn draw_shadow(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        globals: &wgpu::BindGroup,
+        cam_chunk: IVec3,
+        cascade: &Cascade,
+        light: Vec3,
+    ) -> u32 {
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(0, globals, &[]);
+        // Caras +X, -X, +Y, -Y, +Z, -Z.
+        let faces = (light.x < 0.0) as u8
+            | ((light.x > 0.0) as u8) << 1
+            | ((light.y < 0.0) as u8) << 2
+            | ((light.y > 0.0) as u8) << 3
+            | ((light.z < 0.0) as u8) << 4
+            | ((light.z > 0.0) as u8) << 5;
+        let half = CHUNK_SIZE_I as f32 * 0.5;
+        // Radio de la esfera que envuelve un chunk.
+        let radius = half * 3f32.sqrt();
+        let mut draw_calls = 0;
+        for chunk in self.chunks.iter().filter(|chunk| chunk.scale == 1) {
+            let center = ((chunk.origin - cam_chunk) * CHUNK_SIZE_I).as_vec3() + Vec3::splat(half);
+            if cascade.touches(center, radius) {
+                draw_calls += self.draw_faces(pass, chunk, faces);
             }
         }
         draw_calls

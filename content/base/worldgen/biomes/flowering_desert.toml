@@ -1,0 +1,88 @@
+# Desierto florido: lomas suaves de arena que se cubren de alfombras de flores.
+name = "Desierto Florido"
+color = "#F0A8D0"
+
+[nodes]
+rolling = { type = "noise", scale = 420, octaves = 3 }
+rolling_part = { type = "mul", inputs = ["rolling", 16] }
+rough = { type = "mul", inputs = ["hills", 3] }
+plain = { type = "add", inputs = [38, "rolling_part", "rough"] }
+
+coast_bumps = { type = "mul", inputs = ["hills", 10] }
+coast_height = { type = "add", inputs = [28, "coast_bumps"] }
+coast_range = { type = "mul", inputs = ["coastal", "coast_height"] }
+ground = { type = "add", inputs = ["plain", "coast_range"] }
+
+# Costa tendida, con playas anchas.
+shore = { type = "smoothstep", input = "across", from = 0.11, to = 0.2 }
+lowland = { type = "mix", a = "seafloor", b = "ground", t = "shore" }
+height = { type = "add", inputs = ["lowland", "cordillera"] }
+
+# Manchas de floración: cada ruido pinta un color.
+bloom = { type = "noise", scale = 260, octaves = 3, warp = 80 }
+bloom_violet = { type = "noise", scale = 190, octaves = 2 }
+
+[[surface]]
+below = 3
+top = "base:sand"
+
+[[surface]]
+above = 430
+flatter = 1.95
+jitter = 8
+top = "base:snow"
+under = "base:stone"
+
+[[surface]]
+steeper = 1.8
+top = "base:sandstone"
+
+[[surface]]
+above = 170
+jitter = 8
+top = "base:rock_red"
+
+[[surface]]
+node = "bloom"
+node_above = 0.2
+top = "base:bloom_pink"
+under = "base:sand"
+
+[[surface]]
+node = "bloom_violet"
+node_above = 0.32
+top = "base:bloom_purple"
+under = "base:sand"
+
+[[surface]]
+node = "bloom"
+node_below = -0.36
+top = "base:bloom_yellow"
+under = "base:sand"
+
+[[surface]]
+top = "base:sand"
+under = "base:sandstone"
+depth = 4
+
+[[plants]]
+density = 0.1
+block = "base:flower_pink"
+on = ["base:bloom_pink"]
+
+[[plants]]
+density = 0.1
+block = "base:flower_purple"
+on = ["base:bloom_purple"]
+
+[[plants]]
+density = 0.1
+block = "base:flower_yellow"
+on = ["base:bloom_yellow"]
+
+[[trees]]
+density = 0.015
+shape = "bush"
+wood = "base:wood"
+leaves = ["base:leaves_olive"]
+on = ["base:sand", "base:bloom_pink", "base:bloom_yellow"]

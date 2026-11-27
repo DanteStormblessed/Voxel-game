@@ -1,0 +1,69 @@
+# Fiordos: montañas que caen a pico sobre brazos de mar que entran desde el oeste, con
+# islas frente a la costa.
+name = "Fiordos"
+color = "#62AAC8"
+
+[nodes]
+# Macizo: montañas altas en toda la franja.
+bulk = { type = "noise", scale = 500, octaves = 3 }
+bulk_part = { type = "mul", inputs = ["bulk", 50] }
+crest_part = { type = "mul", inputs = ["ridges", 160] }
+rough = { type = "mul", inputs = ["hills", 6] }
+land = { type = "add", inputs = [55, "crest_part", "bulk_part", "rough"] }
+
+# Fiordos: canales estirados de este a oeste, excavados hasta bajo el mar. Se acaban
+# antes de la cordillera alta.
+channel_noise = { type = "noise", scale = [2400, 620], octaves = 3, warp = 150 }
+channel_line = { type = "abs", input = "channel_noise" }
+fjord_raw = { type = "smoothstep", input = "channel_line", from = 0.26, to = 0.05 }
+fjord_reach = { type = "smoothstep", input = "across", from = 0.82, to = 0.62 }
+fjord = { type = "mul", inputs = ["fjord_reach", "fjord_raw"] }
+carved = { type = "mix", a = "land", b = -38, t = "fjord" }
+
+# Costa recortada: un ruido la adelanta y la retrasa, y deja islas.
+islands = { type = "noise", scale = 420, octaves = 3 }
+islands_part = { type = "mul", inputs = ["islands", 0.07] }
+coastline = { type = "add", inputs = ["across", "islands_part"] }
+shore = { type = "smoothstep", input = "coastline", from = 0.07, to = 0.13 }
+lowland = { type = "mix", a = "seafloor", b = "carved", t = "shore" }
+andes = { type = "mul", inputs = ["cordillera", 0.85] }
+height = { type = "add", inputs = ["lowland", "andes"] }
+
+[[surface]]
+below = 2
+top = "base:gravel"
+
+[[surface]]
+above = 250
+flatter = 2.25
+jitter = 10
+top = "base:snow"
+under = "base:stone"
+
+[[surface]]
+steeper = 1.72
+top = "base:stone"
+
+[[surface]]
+above = 185
+jitter = 10
+top = "base:stone"
+
+[[surface]]
+top = "base:moss"
+under = "base:dirt"
+
+[[trees]]
+density = 0.4
+shape = "pine"
+wood = "base:wood"
+leaves = ["base:leaves_dark"]
+trunk = [7, 12]
+on = ["base:moss"]
+
+[[trees]]
+density = 0.08
+shape = "bush"
+wood = "base:wood"
+leaves = ["base:leaves_green"]
+on = ["base:moss"]

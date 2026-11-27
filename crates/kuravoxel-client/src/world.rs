@@ -76,6 +76,8 @@ struct Slot {
 
 struct Tile {
     data: Arc<LodTile>,
+    /// Sube cada vez que el servidor la reenvía: una malla de datos anteriores se descarta.
+    version: u32,
     ready: bool,
     /// Alturas (en chunks de su nivel) de las mallas que tiene subidas.
     chunks: Vec<i32>,
@@ -89,8 +91,8 @@ pub struct World {
     pool: rayon::ThreadPool,
     mesh_tx: Sender<(IVec3, u32, ChunkMesh)>,
     mesh_rx: Receiver<(IVec3, u32, ChunkMesh)>,
-    lod_tx: Sender<(TileKey, TileMeshes)>,
-    lod_rx: Receiver<(TileKey, TileMeshes)>,
+    lod_tx: Sender<(TileKey, u32, TileMeshes)>,
+    lod_rx: Receiver<(TileKey, u32, TileMeshes)>,
 
     slots: FxHashMap<IVec3, Slot>,
     /// Solo se mallan los chunks a esta distancia horizontal (en chunks) o menos; lo que
@@ -410,17 +412,27 @@ impl World {
         if !lod::is_valid_level(key.0) {
             return;
         }
-        // Si ya existía (el servidor la reenvía), la versión nueva la sustituye.
-        self.remove_tile(key, events);
-        self.tiles.insert(
-            key,
-            Tile { data: data.clone(), ready: false, chunks: Vec::new(), retiring: false },
-        );
+        // Si ya existía (el servidor la reenvía, p. ej. al construir en ella), la malla
+        // vieja sigue a la vista hasta que la nueva esté lista: no se ve ningún hueco.
+        let _ = events;
+        let version = match self.tiles.get_mut(&key) {
+            Some(tile) => {
+                tile.data = data.clone();
+                tile.version += 1;
+                tile.retiring = false;
+                tile.version
+            }
+            None => {
+                let tile = Tile { data: data.clone(), version: 0, ready: false, chunks: Vec::new(), retiring: false };
+                self.tiles.insert(key, tile);
+                0
+            }
+        };
         self.lod_in_flight += 1;
         let tx = self.lod_tx.clone();
         self.pool.spawn(move || {
             let meshes = mesher::mesh_lod_tile(&data);
-            let _ = tx.send((key, meshes));
+            let _ = tx.send((key, version, meshes));
         });
     }
 
@@ -542,14 +554,22 @@ impl World {
     }
 
     fn update_lod(&mut self, events: &mut Vec<WorldEvent>) {
-        while let Ok((key, meshes)) = self.lod_rx.try_recv() {
+        while let Ok((key, version, meshes)) = self.lod_rx.try_recv() {
             self.lod_in_flight -= 1;
             // Se ignora si la tesela se soltó o se sustituyó mientras se mallaba.
             let Some(tile) = self.tiles.get_mut(&key) else { continue };
-            if tile.ready {
+            if tile.version != version {
                 continue;
             }
             tile.ready = true;
+            // Capas de la malla anterior que la nueva ya no tiene.
+            for y in std::mem::take(&mut tile.chunks) {
+                if !meshes.iter().any(|(new, _)| *new == y) {
+                    events.push(WorldEvent::Unload {
+                        key: MeshKey { level: key.0, pos: IVec3::new(key.1, y, key.2) },
+                    });
+                }
+            }
             for (y, mesh) in meshes {
                 tile.chunks.push(y);
                 events.push(WorldEvent::Mesh {

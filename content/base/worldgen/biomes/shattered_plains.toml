@@ -1,0 +1,72 @@
+# Llanuras Quebradas: mesetas de roca separadas por abismos de paredes verticales.
+name = "Llanuras Quebradas"
+color = "#B9956B"
+
+[nodes]
+# Las dos consultas comparten semilla: son las mismas celdas. `crack` da la distancia al
+# borde de la meseta y `level`, un valor fijo por meseta (cada una a su altura).
+crack = { type = "cells", scale = 150, seed = 11, warp = 45, warp_scale = 260 }
+level = { type = "cells", scale = 150, seed = 11, warp = 45, warp_scale = 260, mode = "value" }
+
+# Abismo: 1 a menos de 8 m del borde, 0 a más de 13 (paredes casi verticales). Se cierran
+# al entrar en la cordillera.
+chasm_raw = { type = "smoothstep", input = "crack", from = 13, to = 8 }
+chasm = { type = "mul", inputs = ["inland", "chasm_raw"] }
+
+swell = { type = "noise", scale = 1100, octaves = 2 }
+level_part = { type = "mul", inputs = ["level", 14] }
+swell_part = { type = "mul", inputs = ["swell", 18] }
+rough = { type = "mul", inputs = ["hills", 1.5] }
+plateau = { type = "add", inputs = [78, "level_part", "swell_part", "rough"] }
+
+floor_bumps = { type = "mul", inputs = ["hills", 3] }
+floor = { type = "add", inputs = [16, "floor_bumps"] }
+broken = { type = "mix", a = "plateau", b = "floor", t = "chasm" }
+
+# Las mesetas acaban en acantilado sobre el mar.
+shore = { type = "smoothstep", input = "across", from = 0.135, to = 0.16 }
+lowland = { type = "mix", a = "seafloor", b = "broken", t = "shore" }
+andes = { type = "mul", inputs = ["cordillera", 1.1] }
+height = { type = "add", inputs = ["lowland", "andes"] }
+
+[[surface]]
+below = 3
+top = "base:sand"
+
+[[surface]]
+above = 460
+flatter = 1.95
+jitter = 8
+top = "base:snow"
+under = "base:stone"
+
+[[surface]]
+steeper = 2.25
+top = "base:rock_layered"
+
+# Fondo de los abismos: húmedo y verde.
+[[surface]]
+node = "chasm"
+node_above = 0.6
+top = "base:moss"
+under = "base:mud"
+
+[[surface]]
+top = "base:plateau_rock"
+under = "base:rock_layered"
+depth = 70
+
+# Matorral ralo en las mesetas y espeso en el fondo de los abismos.
+[[trees]]
+density = 0.03
+shape = "bush"
+wood = "base:wood"
+leaves = ["base:leaves_olive"]
+on = ["base:plateau_rock"]
+
+[[trees]]
+density = 0.3
+shape = "bush"
+wood = "base:wood"
+leaves = ["base:leaves_green", "base:leaves_lime"]
+on = ["base:moss"]

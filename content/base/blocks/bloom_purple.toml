@@ -1,0 +1,10 @@
+name = "Arena florida violeta"
+color = "#9C6BD8"
+category = "Terreno"
+tags = ["natural", "suelo", "flor"]
+
+# Solo la cara de arriba está cubierta de flores.
+[faces]
+top = "#9C6BD8"
+side = "#F3E3A2"
+bottom = "#F3E3A2"

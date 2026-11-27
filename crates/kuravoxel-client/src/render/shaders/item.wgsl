@@ -2,53 +2,22 @@
 // instancia y 4 vértices generados aquí, con una matriz por ítem que la coloca, la gira
 // y la escala.
 
-struct Globals {
-    view_proj: mat4x4<f32>,
-    cam_chunk: vec4<i32>,
-    cam_local: vec4<f32>,
-    sun_dir: vec4<f32>,
-    sun_color: vec4<f32>,
-    sky_ambient: vec4<f32>,
-    ground_ambient: vec4<f32>,
-    fog_color: vec4<f32>,
-    fog_params: vec4<f32>,
-    params: vec4<f32>,
-    focus: vec4<f32>,
-    voxel_band: vec4<f32>,
-};
-
 struct ItemData {
     // Voxel de la forma → posición relativa al chunk de la cámara.
     model: mat4x4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var palette: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> item: ItemData;
 
 // Igual que en terrain.wgsl.
 const PALETTE_WIDTH: u32 = 2048u;
 
-fn face_u(face: u32) -> vec3<f32> {
-    var table = array<vec3<f32>, 6>(
-        vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, 1.0),
-        vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0),
-    );
-    return table[face];
-}
-
-fn face_v(face: u32) -> vec3<f32> {
-    var table = array<vec3<f32>, 6>(
-        vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0),
-        vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0),
-    );
-    return table[face];
-}
-
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) @interpolate(flat) normal: vec3<f32>,
     @location(1) @interpolate(flat) color: vec3<f32>,
+    @location(2) rel_pos: vec3<f32>,
 };
 
 @vertex
@@ -68,6 +37,7 @@ fn vs_main(
     let rel = item.model * vec4<f32>(local, 1.0);
     var out: VsOut;
     out.clip = globals.view_proj * rel;
+    out.rel_pos = rel.xyz;
     out.normal = normalize((item.model * vec4<f32>(normal, 0.0)).xyz);
     out.color = textureLoad(palette, vec2<u32>(color_index % PALETTE_WIDTH, color_index / PALETTE_WIDTH), 0).rgb;
     return out;
@@ -75,7 +45,6 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let sun = max(dot(in.normal, globals.sun_dir.xyz), 0.0);
-    let ambient = mix(globals.ground_ambient.rgb, globals.sky_ambient.rgb, in.normal.y * 0.5 + 0.5);
-    return vec4<f32>(in.color * (ambient + globals.sun_color.rgb * sun), 1.0);
+    let color = in.color * surface_light(in.normal, in.normal, in.rel_pos);
+    return vec4<f32>(apply_haze(color, in.rel_pos), 1.0);
 }

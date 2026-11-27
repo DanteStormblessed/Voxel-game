@@ -1,0 +1,71 @@
+# Desierto (Atacama): un farellón costero, una pampa alta con dunas y salares, y la
+# cordillera más alta del mundo.
+name = "Desértico"
+color = "#E3B36B"
+
+[nodes]
+# Pampa: meseta a ~95 m con ondulaciones largas.
+pampa_noise = { type = "noise", scale = 800, octaves = 3 }
+pampa_relief = { type = "mul", inputs = ["pampa_noise", 28] }
+# Dunas alargadas; desaparecen en los salares.
+dunes = { type = "ridge", scale = [70, 190], octaves = 2, warp = 40 }
+dune_relief = { type = "mul", inputs = ["no_salar", "dunes", 9] }
+pampa = { type = "add", inputs = [95, "pampa_relief", "dune_relief"] }
+
+# Salares: cuencas planas y blancas.
+salar_spots = { type = "spots", spacing = 1700, radius = 650, chance = 0.7, vary = 0.4 }
+# Un ruido les quita la forma de círculo perfecto.
+salar_noise = { type = "noise", scale = 280, octaves = 3 }
+salar_edge = { type = "mul", inputs = ["salar_noise", 0.3] }
+salar_shape = { type = "add", inputs = ["salar_spots", "salar_edge"] }
+salar = { type = "smoothstep", input = "salar_shape", from = 0.15, to = 0.4 }
+no_salar = { type = "sub", a = 1, b = "salar" }
+basin = { type = "mix", a = "pampa", b = 72, t = "salar" }
+
+# Farellón costero: la pampa cae al mar casi de golpe, sin playa.
+cliff = { type = "smoothstep", input = "across", from = 0.14, to = 0.165 }
+lowland = { type = "mix", a = "seafloor", b = "basin", t = "cliff" }
+
+andes = { type = "mul", inputs = ["cordillera", 1.15] }
+height = { type = "add", inputs = ["lowland", "andes"] }
+
+[[surface]]
+below = 3
+top = "base:sand"
+
+[[surface]]
+above = 500
+flatter = 1.95
+jitter = 8
+top = "base:snow"
+under = "base:stone"
+
+[[surface]]
+steeper = 1.8
+top = "base:rock_red"
+
+[[surface]]
+node = "salar"
+node_above = 0.7
+below = 110
+top = "base:salt"
+depth = 2
+
+[[surface]]
+above = 190
+jitter = 8
+top = "base:rock_red"
+
+[[surface]]
+top = "base:sand_red"
+under = "base:sandstone"
+depth = 4
+
+# Cactus sueltos en la arena.
+[[trees]]
+density = 0.012
+shape = "pillar"
+wood = "base:cactus"
+leaves = ["base:cactus"]
+trunk = [2, 5]
+on = ["base:sand_red"]

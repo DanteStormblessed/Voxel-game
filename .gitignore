@@ -1,4 +1,6 @@
 /target
 /worlds
 /settings.toml
+/environment.toml
+/worldmap.png
 icons_export/

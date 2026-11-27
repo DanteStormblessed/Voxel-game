@@ -1,0 +1,72 @@
+# Mediterráneo: valle seco entre la cordillera de la costa y los Andes, con matorral.
+name = "Mediterráneo"
+color = "#F2E24A"
+
+[nodes]
+valley_noise = { type = "noise", scale = 600, octaves = 3 }
+valley_part = { type = "mul", inputs = ["valley_noise", 12] }
+rough = { type = "mul", inputs = ["hills", 4] }
+valley = { type = "add", inputs = [34, "valley_part", "rough"] }
+
+# Cordillera de la costa: lomas de hasta ~120 m.
+coast_noise = { type = "noise", scale = 250, octaves = 3 }
+coast_abs = { type = "abs", input = "coast_noise" }
+coast_part = { type = "mul", inputs = ["coast_abs", 70] }
+coast_height = { type = "add", inputs = [50, "coast_part"] }
+coast_range = { type = "mul", inputs = ["coastal", "coast_height"] }
+ground = { type = "add", inputs = ["valley", "coast_range"] }
+
+shore = { type = "smoothstep", input = "across", from = 0.11, to = 0.19 }
+lowland = { type = "mix", a = "seafloor", b = "ground", t = "shore" }
+height = { type = "add", inputs = ["lowland", "cordillera"] }
+
+# Humedad: donde es alta crece hierba verde en vez de pasto seco.
+moist = { type = "noise", scale = 500, octaves = 2 }
+# Matorral en manchas.
+grove = { type = "noise", scale = 220, octaves = 2 }
+grove_mask = { type = "smoothstep", input = "grove", from = -0.05, to = 0.45 }
+scrub = { type = "mul", inputs = ["grove_mask", 0.22] }
+
+[[surface]]
+below = 3
+top = "base:sand"
+
+[[surface]]
+above = 390
+flatter = 1.95
+jitter = 8
+top = "base:snow"
+under = "base:stone"
+
+[[surface]]
+steeper = 1.8
+top = "base:stone"
+
+[[surface]]
+above = 230
+jitter = 10
+top = "base:stone"
+
+[[surface]]
+node = "moist"
+node_above = 0.15
+top = "base:grass"
+under = "base:dirt"
+
+[[surface]]
+top = "base:dry_grass"
+under = "base:dirt"
+
+[[trees]]
+density = "scrub"
+wood = "base:wood"
+leaves = ["base:leaves_olive", "base:leaves_olive", "base:leaves_green"]
+trunk = [3, 5]
+on = ["base:dry_grass", "base:grass"]
+
+[[trees]]
+density = 0.04
+shape = "bush"
+wood = "base:wood"
+leaves = ["base:leaves_olive"]
+on = ["base:dry_grass"]
